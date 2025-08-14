@@ -1,0 +1,5 @@
+.DS_Store
+*.log
+*.txt
+*.csv
+fb_key.json
