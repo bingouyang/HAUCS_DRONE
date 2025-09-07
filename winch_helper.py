@@ -1,5 +1,5 @@
 import threading
-import ADS1x15
+import adafruit_ads1x15
 from gpiozero.pins.pigpio import PiGPIOFactory
 from gpiozero import Servo
 import time

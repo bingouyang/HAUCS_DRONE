@@ -1,7 +1,7 @@
 from builtins import range
 from pymavlink import mavutil
 import threading, queue, time, logging, sys
-import ADS1x15
+import adafruit_ads1x15
 from gpiozero.pins.pigpio import PiGPIOFactory
 from gpiozero import Servo
 import math
@@ -219,13 +219,13 @@ set stream rate on an APM
 '''
 '''
 def wait_heartbeat(m):
-    '''wait for a heartbeat so we know the target system IDs'''
+    #wait for a heartbeat so we know the target system IDs
     print("Waiting for APM heartbeat")
     m.wait_heartbeat()
     print("Heartbeat from APM (system %u component %u)" % (m.target_system, m.target_system))
 
 def show_messages(m):
-    '''show incoming mavlink messages'''
+    #show incoming mavlink messages
     while True:
         msg = m.recv_match(blocking=True)
         if not msg:
