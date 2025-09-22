@@ -260,7 +260,7 @@ def send_payload(m, data_cols, state):
         print("Pi buffered remaining after failure-network link is down")
 
 #######################################################
-def run_server():
+'''def run_server():
     while True:
         # open listener
         m = mavutil.mavlink_connection(f"tcpin:0.0.0.0:{PORT}",
@@ -296,13 +296,13 @@ def run_server():
         except KeyboardInterrupt:
             print("Pi exiting")
             break
-            
+'''
 ################### main function #####################
 state = {"seq": 0} #initialize sequence counter
 
-mav = init_network() # create the tcp/ip link
-csv_path = sys.argv[1] if len(sys.argv) > 1 else "input.csv"
-cols=prep_sim_data(csv_path) # create simulation data
-last_hb = 0.0
+#mav = init_network() # create the tcp/ip link
+#csv_path = sys.argv[1] if len(sys.argv) > 1 else "input.csv"
+#cols=prep_sim_data(csv_path) # create simulation data
+#last_hb = 0.0
 
-run_server()
+#run_server()

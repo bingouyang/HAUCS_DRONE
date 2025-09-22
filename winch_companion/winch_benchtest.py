@@ -36,7 +36,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("Starting")
 
-
 def release():
     servo.value = -ROTATION * 0.4
     safety_timer = time.time()
@@ -49,7 +48,6 @@ def release():
             break
         pass
     servo.value = 0
-
 
 def winch_control():
     """
@@ -88,7 +86,6 @@ def winch_control():
             if RETRACTED != 0:
                 RETRACTED = 0
 
-
 def state_machine():
     """
     High-level winch state machine.
@@ -124,7 +121,7 @@ def state_machine():
                     print(f"program ended at {CYCLE_COUNT} cycles")
                     logger.info("program ended at %s cycles", CYCLE_COUNT)
                 time.sleep(10)
-            elif 35 < (time.time() - retrieve_timer):
+            elif  (time.time() - retrieve_timer) > 35:
                 servo.value = 0
                 AUTO_STATE = "idle"
                 logger.warning("ran out of time to retrieve")
@@ -134,7 +131,6 @@ def state_machine():
             release()
             drop_timer = time.time()
             AUTO_STATE = "released"
-
 
 wcontrol = threading.Thread(target=winch_control)
 smachine = threading.Thread(target=state_machine)

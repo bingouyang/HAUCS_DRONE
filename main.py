@@ -1,308 +1,480 @@
-from builtins import range
 from pymavlink import mavutil
 import threading, queue, time, logging, sys
-import adafruit_ads1x15
-from gpiozero.pins.pigpio import PiGPIOFactory
-from gpiozero import Servo
+import traceback
+from builtins import range
 import math
 from dataclasses import dataclass
+import signal
 
+import board
+import busio
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+from gpiozero.pins.pigpio import PiGPIOFactory
+from gpiozero import Servo
 from winch_helper   import *
 from encoder_helper import *
 
-#SERIAL_DEV = /dev/serial0'   # TELEM2 (adjust if needed)
-#SERIAL_BAUD = 115200
-# create a mavlink serial instance
-#master = mavutil.mavlink_connection(CONN_STR, baud=BAUD)
-
-lock = Threading.lock()
-
-# Threads: MAVLink (TELEM2 or UDP SITL), Winch, Bluetooth sensor
-# - Uses only EXTENDED_SYS_STATE for takeoff/landing
-# - Sends STATUSTEXT so GCS can see events
-# - Simple dicts in queues (no classes, no generics)
+############# ADC Simulator ###############
+from adc_sim import ServoSim, LinkedHallADC 
+###########################################
 
 # ---------------- CONFIG ----------------
-# testing against SITL stream:
+# testing against simulator event stream:
 CONN_STR = 'udp:0.0.0.0:14551'
 # wired to Pixhawk TELEM2:
 # CONN_STR = '/dev/serial0'
-BAUD = 115200
+#BAUD = 115200
 
-# Initialize Servo
-servo = Servo(17, pin_factory=PiGPIOFactory())
-servo.value = 0
-# Initialize ADC
-adc = ADS1x15.ADS1115(1)
-adc.setGain(1)
-time.sleep(0.05)
-# hall effect settings (calibrate for every system)
-HALL_MIN = 1035
-HALL_MAX = 12285
+############ Mavlink helper #####################################
+# =========================
+# Mavlink constants
+NAV_IN_AIR       = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
+NAV_ON_GROUND    = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
+NAV_LANDING      = mavutil.mavlink.MAV_LANDED_STATE_LANDING
+NAV_SAFETY_ARMED = mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
 
-# global variables
-CYCLE_COUNT = 0
-CYCLE_LIMIT = 0
-RETRACTED = 1
-AUTO_STATE = "idle"
-AUTO_DROP = 15  # drop time for auto cycling
-AUTO_PWR = 1.0  # retrieve power
-ROTATION = -1  # CW, -1 CCW
+PING_SEC = 2          # interval to check heartbeat
+TOUCH_CONFIRM_SEC = 2    # interval to be sure drone is touch down
 
-# ---------------- SHARED QUEUES ----------------
-q_winch = queue.Queue()   # holds dicts like {'action': 'RELEASE', 'duration': 5.0}
-q_bt_out = queue.Queue()  # holds sensor samples (bytes, dicts, etc.)
-stop_evt = threading.Event()
-
-# ---------------- HELPERS ----------------
-def handle_takeoff_landing_only(landed_state, st):
-    """Detect INIT_TAKEOFF, TAKEOFF, TOUCHDOWN from EXTENDED_SYS_STATE only."""
-    now = time.time()
-    last = st.get('last')
-    seen_init = st.get('seen_init', False)
-    evt = None
-
-    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_IN_AIR \
-       and last != mavutil.mavlink.MAV_LANDED_STATE_IN_AIR:
-        evt = "INIT_TAKEOFF" if not seen_init else "TAKEOFF"
-        st['seen_init'] = True
-        st['touch_t0'] = None
-        st['touch_confirmed'] = False
-
-    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
-        if last != mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
-            st['touch_t0'] = now
-            st['touch_confirmed'] = False
-        else:
-            if (not st['touch_confirmed']
-                and st.get('touch_t0')
-                and (now - st['touch_t0']) >= 2.0):
-                evt = "TOUCHDOWN"
-                st['touch_confirmed'] = True
-
-    st['last'] = landed_state
-    return evt
-
-def send_statustext(link, text, sev=mavutil.mavlink.MAV_SEVERITY_INFO):
-    """Send STATUSTEXT so it shows in GCS."""
-    try:
-        link.mav.statustext_send(sev, text.encode('utf-8')[:50])
-    except Exception:
-        logging.exception("STATUSTEXT send failed")
-
-# ---------------- THREAD: MAVLink ----------------
-def mavlink_thread(stop_evt, q_winch):
-    logging.info("MAVLINK: connecting %s", CONN_STR)
-    if CONN_STR.startswith(('udp:', 'tcp:')):
-        m = mavutil.mavlink_connection(CONN_STR)
-    else:
-        m = mavutil.mavlink_connection(CONN_STR, baud=BAUD)
-
-    hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=5)
-    if not hb:
-        logging.error("MAVLINK: no HEARTBEAT; check connection")
-        return
-    m.target_system = hb.get_srcSystem()
-    m.target_component = hb.get_srcComponent()
-    logging.info("MAVLINK: connected (sys=%s comp=%s)", m.target_system, m.target_component)
-
-    state = {'last': None, 'seen_init': False, 'touch_t0': None, 'touch_confirmed': False}
-    last_lat = last_lon = None
-
-    while not stop_evt.is_set():
-        msg = m.recv_match(blocking=True, timeout=0.5)
-        if not msg:
-            continue
-        t = msg.get_type()
-
-        if t == 'GLOBAL_POSITION_INT':
-            last_lat = msg.lat / 1e7
-            last_lon = msg.lon / 1e7
-
-        elif t == 'EXTENDED_SYS_STATE':
-            evt = handle_takeoff_landing_only(msg.landed_state, state)
-            if evt == "INIT_TAKEOFF":
-                logging.info("INIT_TAKEOFF")
-                send_statustext(m, "[PI] INIT_TAKEOFF")
-            elif evt == "TAKEOFF":
-                logging.info("TAKEOFF")
-                send_statustext(m, "[PI] TAKEOFF")
-            elif evt == "TOUCHDOWN":
-                logging.info("TOUCHDOWN")
-                if last_lat is not None and last_lon is not None:
-                    logging.info("Touchdown GPS: %.7f,%.7f", last_lat, last_lon)
-                    send_statustext(m, f"[PI] TD {last_lat:.5f},{last_lon:.5f}")
-                # Example: queue winch commands
-                q_winch.put({'action': 'RELEASE', 'duration': 5.0})
-                q_winch.put({'action': 'RETRACT', 'duration': 5.0})
-
-    logging.info("MAVLINK: stopping")
-    try: m.close()
-    except: pass
-
-# ---------------- THREAD: Winch ----------------
-def winch_thread(stop_evt, q_winch):
-    logging.info("WINCH: init hardware")
-    while not stop_evt.is_set():
-        try:
-            cmd = q_winch.get(timeout=0.2)
-        except queue.Empty:
-            continue
-
-        action = cmd.get('action')
-        duration = float(cmd.get('duration', 0.0))
-        logging.info("WINCH: %s (%.1fs)", action, duration)
-
-        try:
-            if action == 'RELEASE':
-                # TODO: set motor release
-                time.sleep(max(0.0, duration))
-                # TODO: stop motor
-            elif action == 'RETRACT':
-                # TODO: set motor retract
-                time.sleep(max(0.0, duration))
-                # TODO: stop motor
-            elif action == 'STOP':
-                # TODO: immediate stop
-                pass
-        except Exception:
-            logging.exception("WINCH: error")
-        finally:
-            q_winch.task_done()
-
-    logging.info("WINCH: shutdown")
-    # TODO: safe motor off
-
-# ---------------- THREAD: Bluetooth -------------
-def bluetooth_thread(stop_evt, q_bt_out):
-    logging.info("BT: starting")
-    while not stop_evt.is_set():
-        try:
-            # TODO: connect/read real sensor
-            sample = b"sensor_payload"
-            q_bt_out.put(sample)
-            time.sleep(1.0)
-        except Exception:
-            logging.exception("BT: error; retry soon")
-            time.sleep(2.0)
-    logging.info("BT: stopping")
-
-# ---------------- MAIN ----------------
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(threadName)s: %(message)s",
-        stream=sys.stdout,
-    )
-
-    t_mav = threading.Thread(target=mavlink_thread,   name="MAVLINK",   args=(stop_evt, q_winch), daemon=True)
-    t_win = threading.Thread(target=winch_thread,     name="WINCH",     args=(stop_evt, q_winch), daemon=True)
-    t_bt  = threading.Thread(target=bluetooth_thread, name="BT",        args=(stop_evt, q_bt_out), daemon=True)
-
-    t_mav.start(); t_win.start(); t_bt.start()
-    logging.info("Threads started. Ctrl+C to exit.")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logging.info("Shutting down...")
-        stop_evt.set()
-        t_mav.join(timeout=3); t_win.join(timeout=3); t_bt.join(timeout=3)
-        logging.info("Bye.")
-
-if __name__ == "__main__":
-    main()
-
-'''
-set stream rate on an APM
-'''
-'''
-def wait_heartbeat(m):
-    #wait for a heartbeat so we know the target system IDs
-    print("Waiting for APM heartbeat")
-    m.wait_heartbeat()
-    print("Heartbeat from APM (system %u component %u)" % (m.target_system, m.target_system))
-
-def show_messages(m):
-    #show incoming mavlink messages
-    while True:
-        msg = m.recv_match(blocking=True)
-        if not msg:
-            return
-        elif msg.get_type() == "BAD_DATA":
-            pass
-        elif msg.get_Type() == "":
-            pass
-        else:
-            print(msg)
-
-# wait for the heartbeat msg to find the system ID
-wait_heartbeat(master)
+# Winch constants
+winchParms = {
+    "SERVO_PIN": 17,
+    "ADC_PIN": 0,                 # ADS1115 A0
+    "HALL_MIN": 1035,
+    "HALL_MAX": 12285,
+    "HALL_TARGET": 1035,          # retracted target
+    "RELEASE_PWR": -0.4,          # release power
+    "RETRACT_PWR": 0.30,          # retract power
+    "PWR_LIMIT":   0.30,          # cap retract power
+    "NEUTRAL_POS": -0.04, 
+    "ROTATION_DIRECTION": -1,     # -1 or +1 depending on wiring
+    "SAFETY_TIMEOUT": 0.7,
+    "RETRACT_SETTLE": 50,         # tolerance near target (raw units)
+    "RETRACT_TH": 8000,
+    "PWD_ADP_TH": 10000,          # adjust power when below this threshold(?)
+    "LOG_PREFIX": "[WINCH] ",
+    "FREEFALL_SEC":  20,           # how long to wait after release the winch
+    "RETRACT_SEC":   35,           # how long to wait for the winch to fully retracted. 
+}
 
 ##### LOGGING #####
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
-    filename="winchlog.log",
+    filename="companion_computer.log",
     encoding="utf-8",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 logger.info("Starting")
 
-print("starting")
-last_time = time.time()
-test_data = [i for i in range(96)]
-wcontrol = threading.Thread(target=winch_control)
-smachine = threading.Thread(target=state_machine)
-wcontrol.start()
-smachine.start()
+def process_heartbeat(msg, st):
+    """Track ARMED/DISARMED edges and reset init-takeoff on DISARM."""
+    base_mode = getattr(msg, 'base_mode', 0)
+    armed = bool(base_mode & NAV_SAFETY_ARMED)
+    if st['armed'] is None:
+        st['armed'] = armed
+        # log first observation if you want
+    elif st['armed'] and not armed:
+        # ARMED -> DISARMED: reset for next mission
+        st['seen_init'] = False
+        st['og_count'] = 0
+        st['last_landed'] = NAV_ON_GROUND
+        st['awaiting_final_td'] = False
+        st['ground_ready'] = True       # require ground before counting next INIT_TAKEOFF
+        # print("HB: DISARM -> reset init-takeoff")
+    elif (not st['armed']) and armed:
+        # DISARMED -> ARMED
+        st['ground_ready'] = True       # still require ground->air edge
+        # print("HB: ARMED")
+    st['armed'] = armed
 
-while True:
-    # handle user inputs
-    cmd = input()
-    cmd = cmd.split(",")
-    if len(cmd) < 1:
-        continue
-    elif (len(cmd) == 2) and (cmd[0] == "s"):
-        print("setting servo to: ", float(cmd[1]))
-        servo.value = float(cmd[1])
-    elif cmd[0] == "q":
-        print("stopping")
-        AUTO_STATE = "idle"
-        servo.value = 0
-    elif cmd[0] == "r":
-        print("releasing")
-        release()
-    elif cmd[0] == "p":
-        print(f"servo pwr: {servo.value}")
-        print(f"hall efct: {adc.readADC(0)}")
-        print(f"    state: {AUTO_STATE}")
-        print(f"retracted: {'yes' if RETRACTED == 1 else 'no'}")
-    elif cmd[0] == "start":
-        CYCLE_COUNT = 0
-        CYCLE_LIMIT = 1
-        if len(cmd) == 2:
-            CYCLE_LIMIT = int(cmd[1])
-        print(f"running test for {CYCLE_LIMIT} cycles")
-        AUTO_STATE = "retracted"
+def process_statustext(txt, st):
+    """Mark that we expect a final touchdown soon."""
+    if not txt:
+        return
+    s = txt.lower()
+    if "mission" in s and "complete" in s:
+        st['awaiting_final_td'] = True
 
-    #################################################################
-    ############################  data send #########################
-    if (time.time() - last_time) > 1:
-        last_time = time.time()
-        master.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_WINCH, mavutil.mavlink.MAV_AUTOPILOT_INVALID, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
-        #def: winch_status_send(self, time_usec: int, line_length: float, speed: float, tension: float, voltage: float, current: float, temperature: int, status: int, force_mavlink1: bool = False) -> None:
+def handle_extsys_event(landed_state, st, need_confirm=2):
+    """
+    Returns one of: INIT_TAKEOFF, TAKEOFF, LANDING_START, TOUCHDOWN, TOUCHDOWN_FINAL, or None.
+    - LANDING_START fires once per descent when state enters LANDING.
+    - TOUCHDOWN fires once per ground contact (rate-proof via consecutive ON_GROUND).
+    """
+    last = st['last_landed']
+    evt = None
+
+    # --- LANDING start (edge) ---
+    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_LANDING and last != mavutil.mavlink.MAV_LANDED_STATE_LANDING:
+        # Only treat as sampling if we are NOT expecting the final touchdown
+        if not st['awaiting_final_td'] and not st['landing_fired']:
+            evt = "LANDING_START"          # <-- use this to start sampling
+            st['landing_fired'] = True
+
+    # --- ON_GROUND counting for touchdown ---
+    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
+        st['og_count'] = st['og_count'] + 1 if last == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND else 1
+        st['ground_ready'] = True
+        if not st['td_fired'] and st['og_count'] >= need_confirm:
+            evt = "TOUCHDOWN_FINAL" if st['awaiting_final_td'] else "TOUCHDOWN"
+            st['td_fired'] = True
+            # if this was final TD, prep next mission to start fresh
+            if st['awaiting_final_td']:
+                st['seen_init'] = False
+                st['awaiting_final_td'] = False
+                st['ground_ready'] = True
+    else:
+        # left ground → allow next touchdown to fire again
+        st['og_count'] = 0
+        if st['td_fired']:
+            st['td_fired'] = False
+
+    # Reset LANDING gate when we leave LANDING (so it can fire next time)
+    if last == mavutil.mavlink.MAV_LANDED_STATE_LANDING and landed_state != mavutil.mavlink.MAV_LANDED_STATE_LANDING:
+        st['landing_fired'] = False
+
+    # --- liftoff edges ---
+    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_IN_AIR and last != mavutil.mavlink.MAV_LANDED_STATE_IN_AIR:
+        if not st['seen_init'] and st['ground_ready']:
+            evt = "INIT_TAKEOFF"
+            st['seen_init']   = True
+            st['ground_ready'] = False
+        else:
+            evt = "TAKEOFF"
+
+    st['last_landed'] = landed_state
+    return evt
+
+#########################
+# Mavlink Status
+mv_state = {
+    'last_landed': None,
+    'og_count': 0,
+    'seen_init': False,
+    'armed': None,
+    'awaiting_final_td': False,  # set True after "Mission complete"
+    'ground_ready': True,
+    'td_fired': False,           # prevent repeated TOUCHDOWN
+    'landing_fired': False,      # prevent repeated LANDING_START
+}
+
+# =========================
+# Winch status
+winch_st = {
+    "RETRACTED": 1,             # 1 = retracted, 0 = extended
+}
+
+# =========================
+# Winch helpers
+# =========================
+def hall_raw(c) -> int:
+    if sim_flag == 1:
+        print (f"adc value in hall_raw: {c.read()}")
+        return int(c.read())
+    else:
+        return int(c.value)  # ADS1115
+
+def release_win(servo, adc, cfg, st, stop_evt):
+    # set the servo position to "open", so that the tether will be released.
+    servo.value = -cfg["ROTATION_DIRECTION"] * abs(cfg["RELEASE_PWR"])+cfg["NEUTRAL_POS"]
+    t0 = time.time()
+    print(f"Release, servo open: {servo.value}")
+    while not stop_evt.is_set():
+        if (time.time() - t0) > cfg["SAFETY_TIMEOUT"]:
+            neutral(servo, cfg)
+            print("safety timeout triggered during release")
+            break
+        try:
+            dist = hall_raw(adc) - cfg["HALL_TARGET"]
+        except Exception:
+            neutral(servo, cfg) #return servo to neutral
+            time.sleep(0.25)
+            break
+        print(f"hall_raw(adc): {hall_raw(adc)}, dist: {dist}")
+        if dist > cfg["RETRACT_TH"]:
+            st["RETRACTED"] = 0     #set retracted flag to false.
+            break
+        time.sleep(0.25)
+    neutral(servo, cfg) #move servo back to neutral after let the payload fall
+
+def retract_adpative(servo, adc, cfg, st):
+    """
+    servo retract toward HALL_TARGET, reducing power when getting close to HALL_TARGET.
+    """  
+    print(f"Retract")
+
+    try:
+        dist = hall_raw(adc) - cfg["HALL_TARGET"]
+    except Exception:
+        neutral(servo, cfg)
+        time.sleep(0.25)
+        return False
+
+    pwr = dist / float(cfg["HALL_MAX"] - cfg["HALL_MIN"])
+    pwr = pwr * cfg["PWR_LIMIT"]
+    # exponetially reducing the power when the payload is being retracted(?) is shorten
+    if pwr > 0.0:
+        pwr = math.pow(pwr, 1.0/3.0)
+    if (pwr > cfg["PWR_LIMIT"]):
+        pwr = cfg["PWR_LIMIT"]
+    else:
+        pwr = 0
+    #
+    print(f"hall_raw(adc): {hall_raw(adc)}, dist: {dist}, servo power:{pwr}")
+
+    if dist < (cfg["HALL_TARGET"] + cfg["RETRACT_SETTLE"]):
+        # near target → retracted
+        if st["RETRACTED"] != 1:
+            st["RETRACTED"] = 1
+            if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
+                neutral(servo, cfg)
+            return True
+        # already retracted: ensure neutral if still pushing inward
+        if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
+            neutral(servo, cfg)
+    elif (dist < 10_000) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0): # target is far and winch is being retracted
+        # keep retracting with bounded power
+        servo.value = cfg["ROTATION_DIRECTION"] *  pwr + cfg["NEUTRAL_POS"]
+    elif dist > cfg["RETRACT_TH"]: # if distance is long but servo is not rotating in the right direction(?) 
+
+        if st["RETRACTED"] != 0:
+            st["RETRACTED"] = 0
+    
+    return False
+
+def neutral(servo, cfg):
+    servo.value = cfg["NEUTRAL_POS"]
+
+# using ADC simulator
+sim_flag = 1
+
+# =========================
+def winch_thread(stop_evt, q_winch, cfg, st):
+    try:
+        # setup servo
+        # if sim_flag == 1: 
+        #     servo = ServoSim()  # to use servo simulator
+        # else:
+        #servo = Servo(cfg["SERVO_PIN"],
+        #    MIN_PW = 0.0009,   # 900 µs
+        #    MAX_PW = 0.0021,   # 2100 µs
+        #    pin_factory=PiGPIOFactory()
+        #)
         
-        master.mav.winch_status_send(0,1,2,3,4,5,6,7)
-        master.mav.data96_send(mavutil.mavlink.MAV_TYPE_WINCH, 3, test_data)
+        servo=Servo(cfg["SERVO_PIN"],
+            min_pulse_width=0.0009,
+            max_pulse_width=0.0021,
+            frame_width=0.02,
+            pin_factory=PiGPIOFactory(),
+            initial_value=cfg["NEUTRAL_POS"])  # try neutral
 
-# stream_rate = 1
-# print("Sending all stream request for rate %u" % stream_rate)
-# for i in range(0, 3):
-#     master.mav.request_data_stream_send(master.target_system, master.target_component,
-#                                         mavutil.mavlink.MAV_DATA_STREAM_ALL, stream_rate, 1)
-# show_messages(master)
-'''
-# ---------- messaging ----------
+        #servo.value =  cfg["NEUTRAL_POS"] # correct servo creep...
+        print(f"initialize servo power to neutral:{cfg['NEUTRAL_POS']}")
+    except Exception as e:
+        print(f"Servo init failed: {e}")
+        return
 
+    # set up ADC (HALL SENSOR)
+    try:
+        if sim_flag == 1: # using simulated ADC           
+            adc  = LinkedHallADC(
+                servo = servo,
+                retracted_val=1035,   
+                extended_val=12285, 
+                rotation_direction=cfg["ROTATION_DIRECTION"],
+                speed_release=400000,
+                speed_retract=4000,
+                rate_hz=20,
+                noise=5,
+                start_at="retracted",
+            )                
+        else:
+            i2c = busio.I2C(board.SCL, board.SDA)
+            ads = ADS.ADS1115(i2c)
+            adc = AnalogIn(ads, ADS.P0)
+    except Exception as e:
+        print(f"ADS1115 init failed: {e}")
+        return
+    print("winch ready")
+
+    # local timers
+    drop_timer = time.time()
+    retrieve_timer = time.time()
+    try:
+        while not stop_evt.is_set():
+            # handle incoming command
+            try:
+                cmd = q_winch.get(timeout=0.25)
+            except queue.Empty:
+                cmd = None
+
+            if cmd:
+                act = (cmd.get("action") or "").upper()
+                if act == "RELEASE":
+                    #print("RELEASE")
+                    release_win(servo, adc, cfg, st, stop_evt)
+                    drop_timer = time.time()
+
+                elif act == "RETRACT":
+                    dur = float(cmd.get("duration", 0.0))
+                    print(f"RETRACT for {dur}s")
+                    t0 = time.time()
+                    servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"]
+                    while not stop_evt.is_set() and (time.time() - t0) < dur:
+                        retract_flag= retract_adpative(servo, adc, cfg, st)
+                        if retract_flag == True:
+                            break
+                        time.sleep(0.05)
+                    neutral(servo, cfg)
+
+                elif act == "NEUTRAL":
+                    neutral(servo, cfg)
+            time.sleep(0.1)
+
+    except Exception as e:
+        print(f"winch thread crashed:{e}")
+        neutral(servo, cfg)
+
+    finally:
+        neutral(servo, cfg)
+        time.sleep(0.2)
+
+# ---------------- THREAD: MAVLink ----------------
+def mavlink_thread(stop_evt, q_winch, wincfg, winst):
+    print("MAVLINK: starting (bind %s)", CONN_STR)
+    last_armed = None  # put near other state vars
+    try:
+        if CONN_STR.startswith(('udp:', 'tcp:')):
+            m = mavutil.mavlink_connection(CONN_STR)
+        else:
+            m = mavutil.mavlink_connection(CONN_STR, baud=BAUD)
+
+        print("MAVLINK: waiting for HEARTBEAT...")
+        hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=10)
+        if not hb:
+            print("MAVLINK: no HEARTBEAT in 10s (check simulator IP/port)")
+        else:
+            print("MAVLINK: connected: sys=", hb.get_srcSystem(), "comp=",hb.get_srcComponent())
+
+        last_lat = last_lon = None
+        last_ping = time.time()
+
+        while not stop_evt.is_set():
+            msg = m.recv_match(blocking=True, timeout=0.5)
+            now = time.time()
+            if (now - last_ping) >= PING_SEC:
+                last_ping = now
+
+            if not msg:
+                continue
+
+            t = msg.get_type()
+            if t == 'GLOBAL_POSITION_INT':
+                last_lat = msg.lat / 1e7
+                last_lon = msg.lon / 1e7
+
+            elif t == 'HEARTBEAT':
+                process_heartbeat(msg, mv_state)
+
+            elif t == 'STATUSTEXT':
+                txt = getattr(msg, 'text', '') or getattr(msg, 'message', b'').decode('utf-8','ignore')
+                process_statustext(txt, mv_state)
+                print("STATUSTEXT:", txt)
+            
+            elif t == 'EXTENDED_SYS_STATE':
+                evt = handle_extsys_event(msg.landed_state, mv_state, need_confirm=2)
+
+                if evt == "LANDING_START":
+                    print("EVENT: LANDING_START (sampling) -> start BT sampling")
+                    # Notify the BL to begin sampling
+
+                elif evt == "TOUCHDOWN":
+                    print("EVENT: TOUCHDOWN (intermediate)")
+                    #lock in the GPS and look up the Pond ID.
+                    
+                    #engage winch                    
+                    q_winch.put({"action": "RELEASE"})
+                    # schedule retract without blocking MAVLink loop
+                    FREEFALL_SEC=wincfg["FREEFALL_SEC"] # time expected for payload to reach the expected depth
+
+                    RETRACT_SEC=wincfg["RETRACT_SEC"]   # time for the payload to be fully retracted
+                    def _enqueue_retract():
+                        q_winch.put({"action": "RETRACT", "duration": RETRACT_SEC})
+                    _pending_retract_timer = threading.Timer(FREEFALL_SEC, _enqueue_retract)
+                    _pending_retract_timer.daemon = True
+                    _pending_retract_timer.start()
+
+                elif evt == "TOUCHDOWN_FINAL":
+                    print("EVENT: TOUCHDOWN (final)")
+                    # at end of mission - check to stop all ...
+
+                    # set winch to neutral
+                    q_winch.put({"action": "NEUTRAL"})
+                    
+
+                elif evt == "INIT_TAKEOFF":
+                    print("EVENT: INIT_TAKEOFF")
+
+                elif evt == "TAKEOFF":
+                    print("EVENT: SAMPLING TAKEOFF")
+                    # Request data from BL sensor
+                    
+    except Exception as e:
+        print("MAVLINK thread crashed: %s", e)
+        print(traceback.format_exc())
+
+# ---------------- THREAD: Bluetooth WIP -------------
+def bluetooth_thread(stop_evt, q_bt_out):
+    print("BT: starting")
+    while not stop_evt.is_set():
+        try:
+            print("dummy:connect/read real sensor")
+        except Exception:
+            print("BT thread crashed: %s", e)
+            print(traceback.format_exc())
+
+
+
+# =========================
+# Main
+# =========================
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    stop_evt = threading.Event()
+    q_winch  = queue.Queue()
+
+    t_win = threading.Thread(target=winch_thread,  name="WINCH",   args=(stop_evt, q_winch, winchParms, winch_st))
+    t_mav = threading.Thread(target=mavlink_thread, name="MAVLINK", args=(stop_evt, q_winch, winchParms, winch_st))
+
+    def cleanup(*_):
+        print("Stopping…")
+        stop_evt.set()
+        t_mav.join(timeout=5)
+        t_win.join(timeout=5)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    t_win.start()
+    t_mav.start()
+    
+    # main loop
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Ctrl+C → stopping...")
+        stop_evt.set()
+    finally:
+        cleanup()
+    # Wait for clean shutdown
+
+
+        
+if __name__ == "__main__":
+
+    main()
