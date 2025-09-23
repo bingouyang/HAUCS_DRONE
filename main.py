@@ -83,7 +83,7 @@ def process_heartbeat(msg, st):
     elif (not st['armed']) and armed:
         st['ground_ready'] = True       # still require ground->air edge
     st['armed'] = armed
-    st[auto_mode]=True  # or False ???????????????????????????????????????
+    st['auto_mode']=True  # or False ???????????????????????????????????????
     # check if the drone is currently in manual mode 
     if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED:
         custom_mode_id = msg.custom_mode
@@ -169,7 +169,7 @@ mv_state = {
     'ground_ready': True,
     'td_fired': False,           # prevent repeated TOUCHDOWN
     'landing_fired': False,      # prevent repeated LANDING_START
-    'auto_mode': True            # assume we are in an auto mode
+    'auto_mode': True,           # assume we are in an auto mode
 }
 
 # =========================
