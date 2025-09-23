@@ -75,16 +75,26 @@ def process_heartbeat(msg, st):
     if st['armed'] is None:
         st['armed'] = armed
     elif st['armed'] and not armed:
-        # ARMED -> DISARMED: reset for next mission
         st['seen_init'] = False
         st['og_count'] = 0
         st['last_landed'] = NAV_ON_GROUND
         st['awaiting_final_td'] = False
         st['ground_ready'] = True       # require ground before counting next INIT_TAKEOFF
     elif (not st['armed']) and armed:
-        # DISARMED -> ARMED
         st['ground_ready'] = True       # still require ground->air edge
     st['armed'] = armed
+    st[auto_mode]=True  # or False ???????????????????????????????????????
+    # check if the drone is currently in manual mode 
+    if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED:
+        custom_mode_id = msg.custom_mode
+        mode_name = master.mode_mapping().get(custom_mode_id, 'Unknown')
+        #if mode_name == :
+        if mode_name in ['RTL', 'ACRO', 'ALT_HOLD', 'STABILIZE','LOITER','MANUAL']:
+            print(f"Current mode: (Manual/Semi-Manual), don't deploy winch")
+            st[auto_mode]=False
+        else: # this should be auto mode
+            st[auto_mode]=True
+            print(f"Current mode: {mode_name}")
 
 def process_statustext(txt, st):
     """expecting a final touchdown."""
@@ -110,12 +120,16 @@ def handle_extsys_event(landed_state, st, need_confirm=2):
             evt = "LANDING_START"          # <-- use this to start sampling
             st['landing_fired'] = True
 
+
     # --- ON_GROUND counting for touchdown ---
     if landed_state == NAV_ON_GROUND:
         st['og_count'] = st['og_count'] + 1 if last == NAV_ON_GROUND else 1
         st['ground_ready'] = True
         if not st['td_fired'] and st['og_count'] >= need_confirm:
-            evt = "TOUCHDOWN_FINAL" if st['awaiting_final_td'] else "TOUCHDOWN"
+            if st['awaiting_final_td'] and st['auto_mode']==False: # if we are not 
+                evt = "TOUCHDOWN_FINAL"
+            elif st['auto_mode']==True: # only do this if we are in auto mode.
+                evt = "TOUCHDOWN"
             st['td_fired'] = True
             # if this was final TD, prep next mission to start fresh
             if st['awaiting_final_td']:
@@ -129,10 +143,10 @@ def handle_extsys_event(landed_state, st, need_confirm=2):
             st['td_fired'] = False
 
     # Reset LANDING gate when we leave LANDING (so it can fire next time)
-    if last == NAV_LANDINGG and landed_state != NAV_LANDING:
+    if last == NAV_LANDING and landed_state != NAV_LANDING:
         st['landing_fired'] = False
 
-    # --- liftoff edges ---
+    # --- liftoff  ---
     if landed_state == NAV_IN_AIR and last != NAV_IN_AIR:
         if not st['seen_init'] and st['ground_ready']:
             evt = "INIT_TAKEOFF"
@@ -155,6 +169,7 @@ mv_state = {
     'ground_ready': True,
     'td_fired': False,           # prevent repeated TOUCHDOWN
     'landing_fired': False,      # prevent repeated LANDING_START
+    'auto_mode': True            # assume we are in an auto mode
 }
 
 # =========================
@@ -213,7 +228,7 @@ def retract_adpative(servo, adc, cfg, st):
     pwr = pwr * cfg["PWR_LIMIT"]
     # exponetially reducing the power when the payload is being retracted(?) is shorten
     if pwr > 0.0:
-        pwr = math.pow(pwr, 1.0/3.0)
+        pwr = math.pow(pwr, 1.0/3.0) # to capture the behavior of the magnetic field
     if (pwr > cfg["PWR_LIMIT"]):
         pwr = cfg["PWR_LIMIT"]
     else:
@@ -272,7 +287,6 @@ def winch_thread(stop_evt, q_winch, cfg, st):
     except Exception as e:
         print(f"Servo init failed: {e}")
         return
-
     # set up ADC (HALL SENSOR)
     try:
         if sim_flag == 1: # using simulated ADC           
@@ -386,10 +400,10 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
                 if evt == "LANDING_START":
                     print("EVENT: LANDING_START (sampling) -> start BT sampling")
                     # Notify the BL to begin sampling
+                    #lock in the GPS and look up the Pond ID.
 
                 elif evt == "TOUCHDOWN":
                     print("EVENT: TOUCHDOWN (intermediate)")
-                    #lock in the GPS and look up the Pond ID.
                     
                     #engage winch                    
                     q_winch.put({"action": "RELEASE"})
