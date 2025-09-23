@@ -47,7 +47,7 @@ winchParms = {
     "RELEASE_PWR": -0.4,          # release power
     "RETRACT_PWR": 0.30,          # retract power
     "PWR_LIMIT":   0.30,          # cap retract power
-    "NEUTRAL_POS": -0.04, 
+    "NEUTRAL_POS": -0.04,         # adjust for servo creeping
     "ROTATION_DIRECTION": -1,     # -1 or +1 depending on wiring
     "SAFETY_TIMEOUT": 0.7,
     "RETRACT_SETTLE": 50,         # tolerance near target (raw units)
@@ -74,7 +74,6 @@ def process_heartbeat(msg, st):
     armed = bool(base_mode & NAV_SAFETY_ARMED)
     if st['armed'] is None:
         st['armed'] = armed
-        # log first observation if you want
     elif st['armed'] and not armed:
         # ARMED -> DISARMED: reset for next mission
         st['seen_init'] = False
@@ -82,15 +81,13 @@ def process_heartbeat(msg, st):
         st['last_landed'] = NAV_ON_GROUND
         st['awaiting_final_td'] = False
         st['ground_ready'] = True       # require ground before counting next INIT_TAKEOFF
-        # print("HB: DISARM -> reset init-takeoff")
     elif (not st['armed']) and armed:
         # DISARMED -> ARMED
         st['ground_ready'] = True       # still require ground->air edge
-        # print("HB: ARMED")
     st['armed'] = armed
 
 def process_statustext(txt, st):
-    """Mark that we expect a final touchdown soon."""
+    """expecting a final touchdown."""
     if not txt:
         return
     s = txt.lower()
@@ -100,22 +97,22 @@ def process_statustext(txt, st):
 def handle_extsys_event(landed_state, st, need_confirm=2):
     """
     Returns one of: INIT_TAKEOFF, TAKEOFF, LANDING_START, TOUCHDOWN, TOUCHDOWN_FINAL, or None.
-    - LANDING_START fires once per descent when state enters LANDING.
-    - TOUCHDOWN fires once per ground contact (rate-proof via consecutive ON_GROUND).
+    - LANDING_START - descent when state enters LANDING.
+    - TOUCHDOWN - ground contact (rate-proof via consecutive ON_GROUND).
     """
     last = st['last_landed']
     evt = None
 
     # --- LANDING start (edge) ---
-    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_LANDING and last != mavutil.mavlink.MAV_LANDED_STATE_LANDING:
+    if landed_state == NAV_LANDING and last != NAV_LANDING:
         # Only treat as sampling if we are NOT expecting the final touchdown
         if not st['awaiting_final_td'] and not st['landing_fired']:
             evt = "LANDING_START"          # <-- use this to start sampling
             st['landing_fired'] = True
 
     # --- ON_GROUND counting for touchdown ---
-    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
-        st['og_count'] = st['og_count'] + 1 if last == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND else 1
+    if landed_state == NAV_ON_GROUND:
+        st['og_count'] = st['og_count'] + 1 if last == NAV_ON_GROUND else 1
         st['ground_ready'] = True
         if not st['td_fired'] and st['og_count'] >= need_confirm:
             evt = "TOUCHDOWN_FINAL" if st['awaiting_final_td'] else "TOUCHDOWN"
@@ -132,11 +129,11 @@ def handle_extsys_event(landed_state, st, need_confirm=2):
             st['td_fired'] = False
 
     # Reset LANDING gate when we leave LANDING (so it can fire next time)
-    if last == mavutil.mavlink.MAV_LANDED_STATE_LANDING and landed_state != mavutil.mavlink.MAV_LANDED_STATE_LANDING:
+    if last == NAV_LANDINGG and landed_state != NAV_LANDING:
         st['landing_fired'] = False
 
     # --- liftoff edges ---
-    if landed_state == mavutil.mavlink.MAV_LANDED_STATE_IN_AIR and last != mavutil.mavlink.MAV_LANDED_STATE_IN_AIR:
+    if landed_state == NAV_IN_AIR and last != NAV_IN_AIR:
         if not st['seen_init'] and st['ground_ready']:
             evt = "INIT_TAKEOFF"
             st['seen_init']   = True
