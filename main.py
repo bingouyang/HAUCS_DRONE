@@ -14,14 +14,22 @@ from gpiozero.pins.pigpio import PiGPIOFactory
 from gpiozero import Servo
 from winch_helper   import *
 from encoder_helper import *
-
 ############# ADC Simulator ###############
 from adc_sim import ServoSim, LinkedHallADC 
 ###########################################
+COPTER_MODES = {
+    0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO",
+    4: "GUIDED", 5: "LOITER", 6: "RTL", 7: "CIRCLE",
+    9: "LAND", 11: "DRIFT", 13: "SPORT", 14: "FLIP",
+    15: "AUTOTUNE", 16: "POSHOLD", 17: "BRAKE", 18: "THROW",
+    19: "AVOID_ADSB", 20: "GUIDED_NOGPS", 21: "SMART_RTL",
+    22: "FLOWHOLD", 23: "FOLLOW", 24: "ZIGZAG", 25: "SYSTEMID",
+    26: "AUTOROTATE", 27: "AUTO_RTL",
+}
 
 # ---------------- CONFIG ----------------
 # testing against simulator event stream:
-CONN_STR = 'udp:0.0.0.0:14551'
+CONN_STR = 'udpin:0.0.0.0:14551'
 # wired to Pixhawk TELEM2:
 # CONN_STR = '/dev/serial0'
 #BAUD = 115200
@@ -58,6 +66,29 @@ winchParms = {
     "RETRACT_SEC":   35,           # how long to wait for the winch to fully retracted. 
 }
 
+##########################################################################################
+# configuration for sensor data
+# payload and header for encoding
+DATA_BYTES = 96
+HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
+MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
+SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
+
+FLAG_NONE = 0
+FLAG_EOF  = 1  # end of frame
+FLAG_SOF  = 2  # optional start
+FLAG_SOLO = 3  # optional solo
+
+# buffer json
+BUFFER_PATH = "outbox.json"
+csv_path = "input.csv"
+# sensor data upload status and sequence id
+sensor_upload_failed = {}  # { "seq_id": [ { "var_type": int, "payload": [ints] }, ... ] }
+sensor_state = {"seq": 0} #initialize sequence counter
+
+
+#############################################################################################
+
 ##### LOGGING #####
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -71,6 +102,9 @@ logger.info("Starting")
 def process_heartbeat(msg, st):
     """Track ARMED/DISARMED edges and reset init-takeoff on DISARM."""
     base_mode = getattr(msg, 'base_mode', 0)
+    custom_mode_id = msg.custom_mode
+    custom_mode_name = COPTER_MODES.get(custom_mode_id, f"UNKNOWN({custom_mode_id})")
+    #print(f"custom_mode_id:{custom_mode_id} custom_mode: {custom_mode_name}")
     armed = bool(base_mode & NAV_SAFETY_ARMED)
     if st['armed'] is None:
         st['armed'] = armed
@@ -85,16 +119,12 @@ def process_heartbeat(msg, st):
     st['armed'] = armed
     st['auto_mode']=True  # or False ???????????????????????????????????????
     # check if the drone is currently in manual mode 
-    if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED:
-        custom_mode_id = msg.custom_mode
-        mode_name = master.mode_mapping().get(custom_mode_id, 'Unknown')
-        #if mode_name == :
-        if mode_name in ['RTL', 'ACRO', 'ALT_HOLD', 'STABILIZE','LOITER','MANUAL']:
-            print(f"Current mode: (Manual/Semi-Manual), don't deploy winch")
-            st[auto_mode]=False
-        else: # this should be auto mode
-            st[auto_mode]=True
-            print(f"Current mode: {mode_name}")
+    if custom_mode_name in ['RTL', 'ACRO', 'ALT_HOLD', 'STABILIZE','LOITER','MANUAL','Unknown']:
+        #print(f"Current mode: {custom_mode_name} - (Manual), don't deploy winch")
+        st['auto_mode']=False
+    else: # this should be auto mode
+        st['auto_mode']=True
+        #print(f"Current mode: {custom_mode_name}")
 
 def process_statustext(txt, st):
     """expecting a final touchdown."""
@@ -120,16 +150,17 @@ def handle_extsys_event(landed_state, st, need_confirm=2):
             evt = "LANDING_START"          # <-- use this to start sampling
             st['landing_fired'] = True
 
-
     # --- ON_GROUND counting for touchdown ---
     if landed_state == NAV_ON_GROUND:
         st['og_count'] = st['og_count'] + 1 if last == NAV_ON_GROUND else 1
         st['ground_ready'] = True
         if not st['td_fired'] and st['og_count'] >= need_confirm:
-            if st['awaiting_final_td'] and st['auto_mode']==False: # if we are not 
+            if st['awaiting_final_td'] or st['auto_mode']==False: # if we are not 
                 evt = "TOUCHDOWN_FINAL"
+                print("final landed or not in AUTO mode, don't deploy winch")
             elif st['auto_mode']==True: # only do this if we are in auto mode.
                 evt = "TOUCHDOWN"
+                print("sampling landed in AUTO mode, deploy winch")
             st['td_fired'] = True
             # if this was final TD, prep next mission to start fresh
             if st['awaiting_final_td']:
@@ -182,7 +213,7 @@ winch_st = {
 # Winch helpers
 # =========================
 def hall_raw(c) -> int:
-    if sim_flag == 1:
+    if adc_sim_flag == 1:
         print (f"adc value in hall_raw: {c.read()}")
         return int(c.read())
     else:
@@ -259,9 +290,10 @@ def retract_adpative(servo, adc, cfg, st):
 def neutral(servo, cfg):
     servo.value = cfg["NEUTRAL_POS"]
 
+# use mavlink simulator
+mav_sim_flag = 1
 # using ADC simulator
-sim_flag = 1
-
+adc_sim_flag = 1
 # =========================
 def winch_thread(stop_evt, q_winch, cfg, st):
     try:
@@ -273,15 +305,13 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         #    MIN_PW = 0.0009,   # 900 µs
         #    MAX_PW = 0.0021,   # 2100 µs
         #    pin_factory=PiGPIOFactory()
-        #)
-        
+        #)        
         servo=Servo(cfg["SERVO_PIN"],
             min_pulse_width=0.0009,
             max_pulse_width=0.0021,
             frame_width=0.02,
             pin_factory=PiGPIOFactory(),
             initial_value=cfg["NEUTRAL_POS"])  # try neutral
-
         #servo.value =  cfg["NEUTRAL_POS"] # correct servo creep...
         print(f"initialize servo power to neutral:{cfg['NEUTRAL_POS']}")
     except Exception as e:
@@ -289,7 +319,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         return
     # set up ADC (HALL SENSOR)
     try:
-        if sim_flag == 1: # using simulated ADC           
+        if adc_sim_flag == 1: # using simulated ADC           
             adc  = LinkedHallADC(
                 servo = servo,
                 retracted_val=1035,   
@@ -354,10 +384,14 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
 # ---------------- THREAD: MAVLink ----------------
 def mavlink_thread(stop_evt, q_winch, wincfg, winst):
-    print("MAVLINK: starting (bind %s)", CONN_STR)
+    # initialize failed flag on startup
+    if "failed" not in sensor_state:
+        sensor_state["failed"] = load_buffer(BUFFER_PATH)
+    
+    print(f"MAVLINK: starting (bind {CONN_STR})")
     last_armed = None  # put near other state vars
     try:
-        if CONN_STR.startswith(('udp:', 'tcp:')):
+        if CONN_STR.startswith(('udp', 'tcp')):
             m = mavutil.mavlink_connection(CONN_STR)
         else:
             m = mavutil.mavlink_connection(CONN_STR, baud=BAUD)
@@ -368,6 +402,10 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
             print("MAVLINK: no HEARTBEAT in 10s (check simulator IP/port)")
         else:
             print("MAVLINK: connected: sys=", hb.get_srcSystem(), "comp=",hb.get_srcComponent())
+
+        # clean buffer on reconnect
+        sensor_state["failed"] = resend_buffer(m, sensor_state.get("failed", {}))
+
 
         last_lat = last_lon = None
         last_ping = time.time()
@@ -422,18 +460,25 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
                     # at end of mission - check to stop all ...
 
                     # set winch to neutral
-                    q_winch.put({"action": "NEUTRAL"})
-                    
+                    q_winch.put({"action": "NEUTRAL"})                    
 
                 elif evt == "INIT_TAKEOFF":
                     print("EVENT: INIT_TAKEOFF")
 
                 elif evt == "TAKEOFF":
                     print("EVENT: SAMPLING TAKEOFF")
+                    # always try to clear up the buffer
+                    sensor_state["failed"] = resend_buffer(m, sensor_state.get("failed", {}))
+
                     # Request data from BL sensor
+                    if mav_sim_flag == True:
+                        cols=prep_sim_data(csv_path) # create simulation data                    
                     
+                    send_payload(m, cols,sensor_state)  # main step
+                    #else:
+                        #request data from BL sesnor                    
     except Exception as e:
-        print("MAVLINK thread crashed: %s", e)
+        print(f"MAVLINK thread crashed: {e}")
         print(traceback.format_exc())
 
 # ---------------- THREAD: Bluetooth WIP -------------
@@ -442,12 +487,9 @@ def bluetooth_thread(stop_evt, q_bt_out):
     while not stop_evt.is_set():
         try:
             print("dummy:connect/read real sensor")
-        except Exception:
-            print("BT thread crashed: %s", e)
+        except Exception as e:
+            print(f"BT thread crashed: {e}")
             print(traceback.format_exc())
-
-
-
 # =========================
 # Main
 # =========================
@@ -484,8 +526,6 @@ def main():
         cleanup()
     # Wait for clean shutdown
 
-
-        
 if __name__ == "__main__":
 
     main()
