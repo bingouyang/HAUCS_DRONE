@@ -29,7 +29,10 @@ COPTER_MODES = {
 
 # ---------------- CONFIG ----------------
 # testing against simulator event stream:
-CONN_STR = 'udpin:0.0.0.0:14551'
+#CONN_STR = 'udpin:0.0.0.0:14551'
+CONN_STR_RX = 'udpin:0.0.0.0:14552'
+CONN_STR_TX = 'udpout:10.113.32.16:14551'
+
 # wired to Pixhawk TELEM2:
 # CONN_STR = '/dev/serial0'
 #BAUD = 115200
@@ -69,15 +72,15 @@ winchParms = {
 ##########################################################################################
 # configuration for sensor data
 # payload and header for encoding
-DATA_BYTES = 96
-HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
-MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
-SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
+#DATA_BYTES = 96
+#HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
+#MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
+#SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
 
-FLAG_NONE = 0
-FLAG_EOF  = 1  # end of frame
-FLAG_SOF  = 2  # optional start
-FLAG_SOLO = 3  # optional solo
+#FLAG_NONE = 0
+#FLAG_EOF  = 1  # end of frame
+#FLAG_SOF  = 2  # optional start
+#FLAG_SOLO = 3  # optional solo
 
 # buffer json
 BUFFER_PATH = "outbox.json"
@@ -388,30 +391,32 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
     if "failed" not in sensor_state:
         sensor_state["failed"] = load_buffer(BUFFER_PATH)
     
-    print(f"MAVLINK: starting (bind {CONN_STR})")
+    print(f"MAVLINK: starting (bind {CONN_STR_RX})")
     last_armed = None  # put near other state vars
     try:
-        if CONN_STR.startswith(('udp', 'tcp')):
-            m = mavutil.mavlink_connection(CONN_STR)
+        if CONN_STR_RX.startswith(('udp', 'tcp')):
+            m_rx = mavutil.mavlink_connection(CONN_STR_RX)
         else:
-            m = mavutil.mavlink_connection(CONN_STR, baud=BAUD)
+            m_rx = mavutil.mavlink_connection(CONN_STR_RX, baud=BAUD)
+
+        m_tx = mavutil.mavlink_connection(CONN_STR_TX)
 
         print("MAVLINK: waiting for HEARTBEAT...")
-        hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=10)
+        hb = m_rx.recv_match(type='HEARTBEAT', blocking=True, timeout=10)
         if not hb:
             print("MAVLINK: no HEARTBEAT in 10s (check simulator IP/port)")
         else:
             print("MAVLINK: connected: sys=", hb.get_srcSystem(), "comp=",hb.get_srcComponent())
 
         # clean buffer on reconnect
-        sensor_state["failed"] = resend_buffer(m, sensor_state.get("failed", {}))
+        sensor_state["failed"] = resend_buffer(m_tx, sensor_state.get("failed", {}))
 
 
         last_lat = last_lon = None
         last_ping = time.time()
 
         while not stop_evt.is_set():
-            msg = m.recv_match(blocking=True, timeout=0.5)
+            msg = m_rx.recv_match(blocking=True, timeout=0.5)
             now = time.time()
             if (now - last_ping) >= PING_SEC:
                 last_ping = now
@@ -468,13 +473,13 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
                 elif evt == "TAKEOFF":
                     print("EVENT: SAMPLING TAKEOFF")
                     # always try to clear up the buffer
-                    sensor_state["failed"] = resend_buffer(m, sensor_state.get("failed", {}))
+                    sensor_state["failed"] = resend_buffer(m_tx, sensor_state.get("failed", {}))
 
                     # Request data from BL sensor
                     if mav_sim_flag == True:
                         cols=prep_sim_data(csv_path) # create simulation data                    
                     
-                    send_payload(m, cols,sensor_state)  # main step
+                    send_payload(m_tx, cols,sensor_state)  # main step
                     #else:
                         #request data from BL sesnor                    
     except Exception as e:

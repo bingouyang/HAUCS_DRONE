@@ -14,7 +14,6 @@ DATA_BYTES = 96
 HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
 MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
 SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
-
 # set or read the two high bits in var_len (payload[7])
 FLAG_NONE = 0
 FLAG_EOF  = 1  # end of frame
@@ -27,9 +26,8 @@ failed = {}  # { "seq_id": [ { "var_type": int, "payload": [ints] }, ... ] }
 
 
 # will pad init_DO and init_pressure to same length as the actual data.
-VAR_MAP = {"time": [], "do": [], "temp": [], "press": [], "init_DO":[],"init_pressure":[],"batt_v":[]}
-SEND_ORDER = [k for k in sorted(VAR_MAP) if k != "time"]
-
+VAR_MAP = {"time": [], "DO": [], "temp": [], "pressure": [], "init_DO":[],"init_pressure":[],"batt_v":[]}
+SEND_ORDER = [k for k in VAR_MAP]
 # ---------------- helpers ----------------
 
 # prep simulation data
