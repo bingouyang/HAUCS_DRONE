@@ -11,10 +11,10 @@ Run:
 import sys, time, threading, struct, random
 from pymavlink import mavutil
 
-#PC_IP   = sys.argv[1] if len(sys.argv) > 1 else "10.113.32.16"  # <-- set your PC IP (or pass arg)
-PC_IP   = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.160"  # <-- set your PC IP (or pass arg)
+PC_IP   = sys.argv[1] if len(sys.argv) > 1 else "10.113.32.16"  # <-- set your PC IP (or pass arg)
+#PC_IP   = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.160"  # <-- set your PC IP (or pass arg)
 
-PC_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 14551      # MAVProxy master listening port
+PC_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 14555      # MAVProxy master listening port
 
 # Wire-format (must match your MAVProxy module)
 SCALE      = 32

@@ -61,7 +61,6 @@ def chunker(values, n):
 # the variables is now sent in sequential way:
 # time_packet1, time_packet2... do_packet1, do_packet2,... 
 # temp_packetN... pressure_packtN
-
 def build_frames(values, var_id, start_seq):
     seq = start_seq
     if not values:  # control/marker frame
@@ -234,14 +233,21 @@ def prep_sim_data(csv_path="input.csv"):
     return data_cols
 
 ##########################
-VAR_ID_FRAME_END = 127 # indicating frame end.
+VAR_ID_FRAME_END = 250 # indicating frame end.
 FRAME_END_RESEND = 3   # send frame end 3 times.
 def send_payload(m, data_cols, state, path="outbox.json"):
+    """
+    Create packets and send them. Uses state["failed"] to avoid a global.
+    Keeps the original function name and call pattern.
+    """
+    # Ensure we have a buffer in state (no global)
     if "failed" not in state:
         state["failed"] = load_buffer(path)
         
     first_seq = state["seq"]  # capture BEFORE creating the packets
+    # create packets
     per_var, state["seq"] = prepare_per_var_queues(data_cols, state["seq"])
+    # try to send; pass and update the buffer kept in state
     state["failed"], done = send_or_buffer_all(m, per_var, SEND_ORDER, state["failed"], path)
 
     if done:
@@ -251,13 +257,8 @@ def send_payload(m, data_cols, state, path="outbox.json"):
         print("Pi buffered remaining after failure-network link is down")
 
     # --- end-of-frame marker (values=["control"] as bytes) ---
-    ctrl_vals = list(b"CONTROL")      # int8 list; length must be <= 63    
-    gen = build_frames(ctrl_vals, VAR_ID_FRAME_END, first_seq)
-    try:
-        _, end_pkt = next(gen)  # single packet for 7 bytes
-    except StopIteration:
-        return  # shouldn't happen for b"CONTROL
-    
+    ctrl_vals = list(b"CONTROL")      # int8 list; length must be <= 63
+    pkt = build_frame(first_seq, VAR_ID_FRAME_END, ctrl_vals, flag=FLAG_SOLO)
     for _ in range(FRAME_END_RESEND): #send frame end multple times times.
-        send_packet(m, VAR_ID_FRAME_END, end_pkt, first_seq)
+        send_packet(m, VAR_ID_FRAME_END, pkt, first_seq)
         time.sleep(0.1)

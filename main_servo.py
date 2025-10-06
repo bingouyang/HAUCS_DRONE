@@ -31,9 +31,8 @@ COPTER_MODES = {
 # testing against simulator event stream:
 #CONN_STR = 'udpin:0.0.0.0:14551'
 CONN_STR_RX = 'udpin:0.0.0.0:14551'
-#CONN_STR_TX = 'udpout:10.113.32.16:14551'
-CONN_STR_TX = 'udpout:192.168.1.160:14551'
-
+#CONN_STR_TX = 'udpout:10.113.32.16:14555'
+CONN_STR_TX = 'udpout:192.168.1.160:14555'
 # wired to Pixhawk TELEM2:
 # CONN_STR = '/dev/serial0'
 #BAUD = 115200
@@ -70,29 +69,12 @@ winchParms = {
     "RETRACT_SEC":   35,           # how long to wait for the winch to fully retracted. 
 }
 
-##########################################################################################
-# configuration for sensor data
-# payload and header for encoding
-#DATA_BYTES = 96
-#HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
-#MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
-#SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
-
-#FLAG_NONE = 0
-#FLAG_EOF  = 1  # end of frame
-#FLAG_SOF  = 2  # optional start
-#FLAG_SOLO = 3  # optional solo
-
 # buffer json
 BUFFER_PATH = "outbox.json"
 csv_path = "input.csv"
 # sensor data upload status and sequence id
 sensor_upload_failed = {}  # { "seq_id": [ { "var_type": int, "payload": [ints] }, ... ] }
 sensor_state = {"seq": 0} #initialize sequence counter
-
-
-#############################################################################################
-
 ##### LOGGING #####
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -103,6 +85,150 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("Starting")
 
+
+#########################
+# Mavlink Status
+mv_state = {
+    'last_landed': None,
+    'og_count': 0,
+    'seen_init': False,
+    'armed': None,
+    'awaiting_final_td': False,  # set True after "Mission complete"
+    'ground_ready': True,
+    'td_fired': False,           # prevent repeated TOUCHDOWN
+    'landing_fired': False,      # prevent repeated LANDING_START
+    'auto_mode': True,           # assume we are in an auto mode
+}
+
+# =========================
+# Winch status
+# ---- Winch FSM (flags only; no actions) ----
+
+import time
+
+winch_st = {
+    # state
+    "RETRACTED": 1,          # 1=retracted, 0=extended (update elsewhere if you want)
+}
+
+########################## FSM triggerd by servo ##############################
+fsm_st = {
+    "cycle_active": False,        # persistent: True after rising, False after falling
+
+    # one-shot flags (you consume & clear)
+    "deploy_needed": False,       # set on rising edge
+    "send_to_gcs_needed": False,  # set on falling edge
+    "cycle_activated": False,     # set when cycle_active becomes True
+    "cycle_deactivated": False,   # set when cycle_active becomes False
+
+    # internals (private)
+    "_last_pwm": None,
+    "_last_rel_t": 0.0,
+    "_last_ret_t": 0.0,
+}
+
+# Trigger detection (RC or mission)
+WINCH_CH = 9          # output channel for the "winch"
+PWM_RELEASE = 1800    # rising through => Release ON
+PWM_RETRACT = 1200    # falling through => Release OFF
+DEBOUNCE_S = 0.1
+    
+#Return PWM (µs) for servo channel ch from SERVO_OUTPUT_RAW
+def _servo_out_value(msg, ch):
+    """Return PWM (µs) for 1-based OUTPUT channel ch from SERVO_OUTPUT_RAW, else None."""
+    if ch <= 8:
+        port = 0
+    elif ch <= 16:
+        port = 1
+    else:
+        port = 2
+    if getattr(msg, "port", 0) != port:
+        return None
+    idx = ((ch - 1) % 8) + 1
+    return getattr(msg, f"servo{idx}_raw", None)
+
+def fsm_consume_flags(fsm):
+    """Read & clear one-shot flags."""
+    keys = ("deploy_needed", "send_to_gcs_needed", "cycle_activated", "cycle_deactivated")
+    out = {k: fsm.get(k, False) for k in keys}
+    for k in keys:
+        fsm[k] = False
+    return out
+
+def on_rising_edge(fsm, dwell_s=None, now=None):
+    """
+    Rising edge servo signal:
+      - mark cycle active
+      - raise deploy_needed
+    """
+    fsm["cycle_active"] = True
+    fsm["deploy_needed"] = True
+
+def on_airborne_true(fsm):
+    """
+    First transition to airborne during an active cycle:
+      - raise ble_upload_needed once per cycle
+    """
+    if fsm["cycle_active"] and not fsm["ble_started"]:
+        fsm["ble_started"] = True
+        fsm["ble_upload_needed"] = True
+
+def on_falling_edge(fsm):
+    """
+    Falling edge of servo signal:
+      - raise send_to_gcs_needed
+      - reset persistent cycle state
+    """
+    fsm["send_to_gcs_needed"] = True
+    fsm_reset_cycle(fsm)
+
+def fsm_reset_cycle(fsm):
+    #Reset persistent state
+    fsm["cycle_active"] = False
+    fsm["ble_started"] = False
+    fsm["retract_deadline"] = None
+
+def handle_servo_output_raw(msg, fsm,
+                            ch=WINCH_CH,
+                            pwm_release=PWM_RELEASE,
+                            pwm_retract=PWM_RETRACT,
+                            debounce_s=DEBOUNCE_S):
+    """Edge detector: sets deploy/send flags and cycle activate/deactivate flags."""
+    # lazy init
+    if "_last_pwm" not in fsm:
+        fsm["_last_pwm"] = None
+        fsm["_last_rel_t"] = 0.0
+        fsm["_last_ret_t"] = 0.0
+
+    pwm = _servo_out_value(msg, ch)
+    if pwm is None:
+        return
+
+    now_m = time.monotonic()
+    last_pwm = fsm["_last_pwm"]
+    if last_pwm is not None:
+        if (last_pwm != pwm):
+                print(f"pwm changed: last_pwm:{last_pwm}, pwm:{pwm} pwm_retract:{pwm_retract}, pwm_release:{pwm_release}")
+        # Rising edge (Release ON) -> activate cycle + deploy flag
+        if last_pwm < pwm_release <= pwm and (now_m - fsm["_last_rel_t"]) > debounce_s:
+            fsm["_last_rel_t"] = now_m
+            if not fsm["cycle_active"]:
+                fsm["cycle_active"] = True
+                fsm["cycle_activated"] = True
+            fsm["deploy_needed"] = True
+            print("rising edge detected")
+        # Falling edge (Release OFF) -> deactivate cycle + send-to-GCS flag
+        if last_pwm > pwm_retract >= pwm: #and (now_m - fsm["_last_ret_t"]) > debounce_s:
+            fsm["_last_ret_t"] = now_m
+            if fsm["cycle_active"]:
+                fsm["cycle_active"] = False
+                fsm["cycle_deactivated"] = True
+            fsm["send_to_gcs_needed"] = True
+            print("falling edge detected")
+
+    fsm["_last_pwm"] = pwm
+
+############################################################################
 def process_heartbeat(msg, st):
     """Track ARMED/DISARMED edges and reset init-takeoff on DISARM."""
     base_mode = getattr(msg, 'base_mode', 0)
@@ -193,32 +319,12 @@ def handle_extsys_event(landed_state, st, need_confirm=2):
     st['last_landed'] = landed_state
     return evt
 
-#########################
-# Mavlink Status
-mv_state = {
-    'last_landed': None,
-    'og_count': 0,
-    'seen_init': False,
-    'armed': None,
-    'awaiting_final_td': False,  # set True after "Mission complete"
-    'ground_ready': True,
-    'td_fired': False,           # prevent repeated TOUCHDOWN
-    'landing_fired': False,      # prevent repeated LANDING_START
-    'auto_mode': True,           # assume we are in an auto mode
-}
-
-# =========================
-# Winch status
-winch_st = {
-    "RETRACTED": 1,             # 1 = retracted, 0 = extended
-}
-
 # =========================
 # Winch helpers
 # =========================
 def hall_raw(c) -> int:
     if adc_sim_flag == 1:
-        print (f"adc value in hall_raw: {c.read()}")
+        #print (f"adc value in hall_raw: {c.read()}")
         return int(c.read())
     else:
         return int(c.value)  # ADS1115
@@ -227,7 +333,7 @@ def release_win(servo, adc, cfg, st, stop_evt):
     # set the servo position to "open", so that the tether will be released.
     servo.value = -cfg["ROTATION_DIRECTION"] * abs(cfg["RELEASE_PWR"])+cfg["NEUTRAL_POS"]
     t0 = time.time()
-    print(f"Release, servo open: {servo.value}")
+    print(f"Release, winch servo open: {servo.value}")
     while not stop_evt.is_set():
         if (time.time() - t0) > cfg["SAFETY_TIMEOUT"]:
             neutral(servo, cfg)
@@ -239,7 +345,7 @@ def release_win(servo, adc, cfg, st, stop_evt):
             neutral(servo, cfg) #return servo to neutral
             time.sleep(0.25)
             break
-        print(f"hall_raw(adc): {hall_raw(adc)}, dist: {dist}")
+        #print(f"hall_raw(adc): {hall_raw(adc)}, dist: {dist}")
         if dist > cfg["RETRACT_TH"]:
             st["RETRACTED"] = 0     #set retracted flag to false.
             break
@@ -250,7 +356,7 @@ def retract_adpative(servo, adc, cfg, st):
     """
     servo retract toward HALL_TARGET, reducing power when getting close to HALL_TARGET.
     """  
-    print(f"Retract")
+    #print("Retract")
 
     try:
         dist = hall_raw(adc) - cfg["HALL_TARGET"]
@@ -269,7 +375,7 @@ def retract_adpative(servo, adc, cfg, st):
     else:
         pwr = 0
     #
-    print(f"hall_raw(adc): {hall_raw(adc)}, dist: {dist}, servo power:{pwr}")
+    #print(f"hall_raw(adc): {hall_raw(adc)}, dist: {dist}, servo power:{pwr}")
 
     if dist < (cfg["HALL_TARGET"] + cfg["RETRACT_SETTLE"]):
         # near target → retracted
@@ -288,11 +394,18 @@ def retract_adpative(servo, adc, cfg, st):
 
         if st["RETRACTED"] != 0:
             st["RETRACTED"] = 0
-    
     return False
 
 def neutral(servo, cfg):
     servo.value = cfg["NEUTRAL_POS"]
+
+def _servo_out_value(msg, ch):
+    """Return PWM (µs) for 1-based output channel ch from SERVO_OUTPUT_RAW, else None."""
+    port = 0 if ch <= 8 else 1 if ch <= 16 else 2
+    if getattr(msg, 'port', 0) != port:
+        return None
+    idx = ((ch - 1) % 8) + 1
+    return getattr(msg, f"servo{idx}_raw", None)
 
 # use mavlink simulator
 mav_sim_flag = 1
@@ -408,10 +521,8 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
             print("MAVLINK: no HEARTBEAT in 10s (check simulator IP/port)")
         else:
             print("MAVLINK: connected: sys=", hb.get_srcSystem(), "comp=",hb.get_srcComponent())
-
         # clean buffer on reconnect
         sensor_state["failed"] = resend_buffer(m_tx, sensor_state.get("failed", {}))
-
 
         last_lat = last_lon = None
         last_ping = time.time()
@@ -433,22 +544,10 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
             elif t == 'HEARTBEAT':
                 process_heartbeat(msg, mv_state)
 
-            elif t == 'STATUSTEXT':
-                txt = getattr(msg, 'text', '') or getattr(msg, 'message', b'').decode('utf-8','ignore')
-                process_statustext(txt, mv_state)
-                print("STATUSTEXT:", txt)
-            
             elif t == 'EXTENDED_SYS_STATE':
                 evt = handle_extsys_event(msg.landed_state, mv_state, need_confirm=2)
-
-                if evt == "LANDING_START":
-                    print("EVENT: LANDING_START (sampling) -> start BT sampling")
-                    # Notify the BL to begin sampling
-                    #lock in the GPS and look up the Pond ID.
-
-                elif evt == "TOUCHDOWN":
+                '''if evt == "TOUCHDOWN":
                     print("EVENT: TOUCHDOWN (intermediate)")
-                    
                     #engage winch                    
                     q_winch.put({"action": "RELEASE"})
                     # schedule retract without blocking MAVLink loop
@@ -460,29 +559,45 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
                     _pending_retract_timer = threading.Timer(FREEFALL_SEC, _enqueue_retract)
                     _pending_retract_timer.daemon = True
                     _pending_retract_timer.start()
-
-                elif evt == "TOUCHDOWN_FINAL":
+                '''
+                if evt == "TOUCHDOWN_FINAL":
                     print("EVENT: TOUCHDOWN (final)")
-                    # at end of mission - check to stop all ...
-
                     # set winch to neutral
                     q_winch.put({"action": "NEUTRAL"})                    
-
                 elif evt == "INIT_TAKEOFF":
                     print("EVENT: INIT_TAKEOFF")
+            
+            elif t == 'SERVO_OUTPUT_RAW':
+                handle_servo_output_raw(msg, fsm_st)
+                # Consume exactly once per loop; this clears the one-shot flags
+                flags = fsm_consume_flags(fsm_st)
+                if flags["cycle_activated"]:
+                    pass
+                    # infor BT
+                if flags["deploy_needed"]:
+                    print("EVENT: start BT sampling")
+                    # lock in lat/lng
+                    
+                    #engage winch                    
+                    q_winch.put({"action": "RELEASE"})
+                    # schedule retract without blocking MAVLink loop
+                    FREEFALL_SEC=wincfg["FREEFALL_SEC"] # time expected for payload to reach the expected depth
+                    RETRACT_SEC=wincfg["RETRACT_SEC"]   # time for the payload to be fully retracted
+                    def _enqueue_retract():
+                        q_winch.put({"action": "RETRACT", "duration": RETRACT_SEC})
+                    _pending_retract_timer = threading.Timer(FREEFALL_SEC, _enqueue_retract)
+                    _pending_retract_timer.daemon = True
+                    _pending_retract_timer.start()
 
-                elif evt == "TAKEOFF":
-                    print("EVENT: SAMPLING TAKEOFF")
-                    # always try to clear up the buffer
+                if flags["send_to_gcs_needed"]:
                     sensor_state["failed"] = resend_buffer(m_tx, sensor_state.get("failed", {}))
-
                     # Request data from BL sensor
                     if mav_sim_flag == True:
                         cols=prep_sim_data(csv_path) # create simulation data                    
-                    
                     send_payload(m_tx, cols,sensor_state)  # main step
-                    #else:
-                        #request data from BL sesnor                    
+                if flags["cycle_deactivated"]:
+                    print("EVENT: cycle_deactivated")
+
     except Exception as e:
         print(f"MAVLINK thread crashed: {e}")
         print(traceback.format_exc())
