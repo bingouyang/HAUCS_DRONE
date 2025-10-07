@@ -6,6 +6,9 @@ import math
 from dataclasses import dataclass
 import signal
 
+from PyQt5.QtCore import QMutex
+from typing import Dict, Any
+
 import board
 import busio
 import adafruit_ads1x15.ads1115 as ADS
@@ -14,9 +17,11 @@ from gpiozero.pins.pigpio import PiGPIOFactory
 from gpiozero import Servo
 from winch_helper   import *
 from encoder_helper import *
+from bt_helper import *
 ############# ADC Simulator ###############
 from adc_sim import ServoSim, LinkedHallADC 
 ###########################################
+
 COPTER_MODES = {
     0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO",
     4: "GUIDED", 5: "LOITER", 6: "RTL", 7: "CIRCLE",
@@ -31,25 +36,22 @@ COPTER_MODES = {
 # testing against simulator event stream:
 #CONN_STR = 'udpin:0.0.0.0:14551'
 CONN_STR_RX = 'udpin:0.0.0.0:14551'
-#CONN_STR_TX = 'udpout:10.113.32.16:14555'
-CONN_STR_TX = 'udpout:192.168.1.160:14555'
+CONN_STR_TX = 'udpout:10.113.32.16:14555'
+#CONN_STR_TX = 'udpout:192.168.1.160:14555'
 # wired to Pixhawk TELEM2:
 # CONN_STR = '/dev/serial0'
 #BAUD = 115200
 
-############ Mavlink helper #####################################
-# =========================
 # Mavlink constants
 NAV_IN_AIR       = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
 NAV_ON_GROUND    = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
 NAV_LANDING      = mavutil.mavlink.MAV_LANDED_STATE_LANDING
 NAV_SAFETY_ARMED = mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-
 PING_SEC = 2          # interval to check heartbeat
 TOUCH_CONFIRM_SEC = 2    # interval to be sure drone is touch down
 
 # Winch constants
-winchParms = {
+wParms = {
     "SERVO_PIN": 17,
     "ADC_PIN": 0,                 # ADS1115 A0
     "HALL_MIN": 1035,
@@ -69,6 +71,21 @@ winchParms = {
     "RETRACT_SEC":   35,           # how long to wait for the winch to fully retracted. 
 }
 
+#BLE parms
+BLE_POLL_SEC = 1.0
+BLE_SAMPLE_SIZE  = 120 # two min of data
+BLE_SAMPLE_TYPE  = "manual"
+BLE_FETCH_TIMEOUT = 30
+
+ble_st ={
+    "ble": None,
+    "ble_mutex": QMutex(),
+    'last_cols', None,
+    "gcs_ready", False,
+    "c_status", "init",
+}
+##########################################
+
 # buffer json
 BUFFER_PATH = "outbox.json"
 csv_path = "input.csv"
@@ -85,7 +102,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("Starting")
 
-
 #########################
 # Mavlink Status
 mv_state = {
@@ -100,27 +116,18 @@ mv_state = {
     'auto_mode': True,           # assume we are in an auto mode
 }
 
-# =========================
-# Winch status
-# ---- Winch FSM (flags only; no actions) ----
-
-import time
-
+# =================== Winch status
 winch_st = {
-    # state
     "RETRACTED": 1,          # 1=retracted, 0=extended (update elsewhere if you want)
 }
-
 ########################## FSM triggerd by servo ##############################
 fsm_st = {
     "cycle_active": False,        # persistent: True after rising, False after falling
-
     # one-shot flags (you consume & clear)
     "deploy_needed": False,       # set on rising edge
     "send_to_gcs_needed": False,  # set on falling edge
     "cycle_activated": False,     # set when cycle_active becomes True
     "cycle_deactivated": False,   # set when cycle_active becomes False
-
     # internals (private)
     "_last_pwm": None,
     "_last_rel_t": 0.0,
@@ -128,11 +135,11 @@ fsm_st = {
 }
 
 # Trigger detection (RC or mission)
-WINCH_CH = 9          # output channel for the "winch"
+TRIGGER_CH = 9          # output channel for the "winch"
 PWM_RELEASE = 1800    # rising through => Release ON
 PWM_RETRACT = 1200    # falling through => Release OFF
 DEBOUNCE_S = 0.1
-    
+####################################################
 #Return PWM (µs) for servo channel ch from SERVO_OUTPUT_RAW
 def _servo_out_value(msg, ch):
     """Return PWM (µs) for 1-based OUTPUT channel ch from SERVO_OUTPUT_RAW, else None."""
@@ -189,12 +196,11 @@ def fsm_reset_cycle(fsm):
     fsm["retract_deadline"] = None
 
 def handle_servo_output_raw(msg, fsm,
-                            ch=WINCH_CH,
+                            ch=TRIGGER_CH,
                             pwm_release=PWM_RELEASE,
                             pwm_retract=PWM_RETRACT,
                             debounce_s=DEBOUNCE_S):
     """Edge detector: sets deploy/send flags and cycle activate/deactivate flags."""
-    # lazy init
     if "_last_pwm" not in fsm:
         fsm["_last_pwm"] = None
         fsm["_last_rel_t"] = 0.0
@@ -319,6 +325,16 @@ def handle_extsys_event(landed_state, st, need_confirm=2):
     st['last_landed'] = landed_state
     return evt
 
+######################
+# BLE initialization
+def init_sensor_status(ble):
+    ble.set_calibration_pressure()
+    ble.get_init_do()
+    ble.get_init_pressure()
+    ble.get_battery()
+    ble.get_sampling_rate()
+    ble.set_threshold(BLE_SAMPLING_END) # initialize threshold to artificially high 
+
 # =========================
 # Winch helpers
 # =========================
@@ -374,9 +390,6 @@ def retract_adpative(servo, adc, cfg, st):
         pwr = cfg["PWR_LIMIT"]
     else:
         pwr = 0
-    #
-    #print(f"hall_raw(adc): {hall_raw(adc)}, dist: {dist}, servo power:{pwr}")
-
     if dist < (cfg["HALL_TARGET"] + cfg["RETRACT_SETTLE"]):
         # near target → retracted
         if st["RETRACTED"] != 1:
@@ -407,6 +420,29 @@ def _servo_out_value(msg, ch):
     idx = ((ch - 1) % 8) + 1
     return getattr(msg, f"servo{idx}_raw", None)
 
+###### BLE...####################################
+def _broadcast(x, n):
+    return [] if n <= 0 else [x] * n
+
+def try_fetch_until(timeout_s: float, q_ble, _st, poll=0.2):
+    """
+    asking BLE to FETCH until _st['gcs_ready'] or timeout.
+    """
+    while time.time() < timeout_s:
+        # Only ask to fetch when connected (saves BLE spam)
+        if _st.get('connected'):
+            q_ble.put({"cmd": "FETCH"})
+        # Wait a bit for the BLE thread to run get_sample_data()
+        t0 = time.time()
+        while time.time() - t0 < poll:
+            if _st.get("gcs_ready"):
+                cols = _st["last_cols"]
+                _st["gcs_ready"] = False
+                return True, cols
+            time.sleep(0.05)
+        # otherwise loop and try again
+    return False, None
+
 # use mavlink simulator
 mav_sim_flag = 1
 # using ADC simulator
@@ -417,19 +453,13 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         # setup servo
         # if sim_flag == 1: 
         #     servo = ServoSim()  # to use servo simulator
-        # else:
-        #servo = Servo(cfg["SERVO_PIN"],
-        #    MIN_PW = 0.0009,   # 900 µs
-        #    MAX_PW = 0.0021,   # 2100 µs
-        #    pin_factory=PiGPIOFactory()
-        #)        
+        # else:    
         servo=Servo(cfg["SERVO_PIN"],
             min_pulse_width=0.0009,
             max_pulse_width=0.0021,
             frame_width=0.02,
             pin_factory=PiGPIOFactory(),
             initial_value=cfg["NEUTRAL_POS"])  # try neutral
-        #servo.value =  cfg["NEUTRAL_POS"] # correct servo creep...
         print(f"initialize servo power to neutral:{cfg['NEUTRAL_POS']}")
     except Exception as e:
         print(f"Servo init failed: {e}")
@@ -467,7 +497,6 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 cmd = q_winch.get(timeout=0.25)
             except queue.Empty:
                 cmd = None
-
             if cmd:
                 act = (cmd.get("action") or "").upper()
                 if act == "RELEASE":
@@ -490,7 +519,6 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 elif act == "NEUTRAL":
                     neutral(servo, cfg)
             time.sleep(0.1)
-
     except Exception as e:
         print(f"winch thread crashed:{e}")
         neutral(servo, cfg)
@@ -499,8 +527,92 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         neutral(servo, cfg)
         time.sleep(0.2)
 
+def ble_thread(stop_evt, q_ble, st):
+    poll_sec   = BLE_POLL_SEC
+    ble = st['ble'] = BluetoothReader(st['mutex'])
+
+    if ble.connect():
+        st['c_status'] = 'connected'
+        try:
+            #initialize sampling size (120) and type (manual).
+            ble.init_sensor_status(BLE_SAMPLE_SIZE, BLE_SAMPLE_TYPE)
+        except Exception:
+            st['c_status'] = 'connected_no_inits'
+    else:
+        st['c_status'] = 'disconnected'
+    # retry till connect
+    last_poll = 0.0
+    while not stop_evt.is_set():
+        now = time.time()
+        # periodic connection maintenance (fixed-rate retry)
+        if now - last_poll >= poll_sec:
+            last_poll = now
+            try:
+                ok = bool(ble.check_connection_status())
+            except Exception:
+                ok = False
+            if not ok:
+                st['c_status']  = 'disconnected'
+                try:
+                    if ble.reconnect():
+                        st['c_status']  = 'connected'
+                except Exception:
+                    pass
+            else:
+                st['c_status']  = 'connected'
+        # Handle queued commands
+        try:
+            cmd = q_ble.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        
+        action = (cmd.get('cmd') or '').upper()
+        if action == 'START':
+            if ble.sdata.get('connection')::
+                try:
+                    # reset sampling counter
+                    ble.set_sample_reset()     
+                    st['sampling'] = True
+                    st['c_status'] = 'sampling_started'  # or 'reset_done'
+                except Exception:
+                    st['c_status'] = 'start_failed'
+            else:
+                st['c_status'] = 'start_skipped_disconnected'
+        elif action == 'FETCH':
+            if st['connected']:
+                try:
+                    # set the threshold high to stop sampling
+                    ok = bool(ble.get_sample_data())
+                    st['sampling'] = False
+                    if ok:
+                        do_list   = ble.sdata.get('do_vals')        or []
+                        temp_list = ble.sdata.get('temp_vals')      or []
+                        press_list= ble.sdata.get('pressure_vals')  or []
+                        n = len(do_list)         # sample length
+                        ts_list = list(range(n)) # generate sampling order
+
+                        st['last_cols'] = {
+                            'time': ts_list,
+                            'do': do_list,
+                            'temp': temp_list,
+                            'press': press_list,
+                            # broadcast scalars to length n
+                            'init_DO':       _broadcast(ble.sdata.get('init_do'), n),
+                            'init_pressure': _broadcast(ble.sdata.get('init_pressure'), n),
+                            'batt_v':        _broadcast(ble.sdata.get('battv'), n),
+                        }
+                        st['gcs_ready'] = True
+                        st['c_status']  = 'fetched'
+                        # optional: ble.set_sample_reset()  # if you want to immediately start a fresh run
+                    else:
+                        st['c_status'] = 'fetch_empty'
+                except Exception:
+                    st['c_status'] = 'fetch_failed'
+            else:
+                st['c_status'] = 'fetch_skipped_disconnected'
+
 # ---------------- THREAD: MAVLink ----------------
-def mavlink_thread(stop_evt, q_winch, wincfg, winst):
+def mavlink_thread(stop_evt, q_winch, q_ble, wincfg, winst,blest):
     # initialize failed flag on startup
     if "failed" not in sensor_state:
         sensor_state["failed"] = load_buffer(BUFFER_PATH)
@@ -512,7 +624,6 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
             m_rx = mavutil.mavlink_connection(CONN_STR_RX)
         else:
             m_rx = mavutil.mavlink_connection(CONN_STR_RX, baud=BAUD)
-
         m_tx = mavutil.mavlink_connection(CONN_STR_TX)
 
         print("MAVLINK: waiting for HEARTBEAT...")
@@ -532,7 +643,6 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
             now = time.time()
             if (now - last_ping) >= PING_SEC:
                 last_ping = now
-
             if not msg:
                 continue
 
@@ -543,29 +653,12 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
 
             elif t == 'HEARTBEAT':
                 process_heartbeat(msg, mv_state)
-
+                
             elif t == 'EXTENDED_SYS_STATE':
                 evt = handle_extsys_event(msg.landed_state, mv_state, need_confirm=2)
-                '''if evt == "TOUCHDOWN":
-                    print("EVENT: TOUCHDOWN (intermediate)")
-                    #engage winch                    
-                    q_winch.put({"action": "RELEASE"})
-                    # schedule retract without blocking MAVLink loop
-                    FREEFALL_SEC=wincfg["FREEFALL_SEC"] # time expected for payload to reach the expected depth
-
-                    RETRACT_SEC=wincfg["RETRACT_SEC"]   # time for the payload to be fully retracted
-                    def _enqueue_retract():
-                        q_winch.put({"action": "RETRACT", "duration": RETRACT_SEC})
-                    _pending_retract_timer = threading.Timer(FREEFALL_SEC, _enqueue_retract)
-                    _pending_retract_timer.daemon = True
-                    _pending_retract_timer.start()
-                '''
                 if evt == "TOUCHDOWN_FINAL":
-                    print("EVENT: TOUCHDOWN (final)")
-                    # set winch to neutral
-                    q_winch.put({"action": "NEUTRAL"})                    
-                elif evt == "INIT_TAKEOFF":
-                    print("EVENT: INIT_TAKEOFF")
+                    print("EVENT: FINAL TOUCHDOWN")
+                    q_winch.put({"action": "NEUTRAL"}) # set winch to neutral
             
             elif t == 'SERVO_OUTPUT_RAW':
                 handle_servo_output_raw(msg, fsm_st)
@@ -573,11 +666,9 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
                 flags = fsm_consume_flags(fsm_st)
                 if flags["cycle_activated"]:
                     pass
-                    # infor BT
+                    # inform BT
                 if flags["deploy_needed"]:
-                    print("EVENT: start BT sampling")
-                    # lock in lat/lng
-                    
+                    print("EVENT: start BT sampling")                    
                     #engage winch                    
                     q_winch.put({"action": "RELEASE"})
                     # schedule retract without blocking MAVLink loop
@@ -593,41 +684,43 @@ def mavlink_thread(stop_evt, q_winch, wincfg, winst):
                     sensor_state["failed"] = resend_buffer(m_tx, sensor_state.get("failed", {}))
                     # Request data from BL sensor
                     if mav_sim_flag == True:
-                        cols=prep_sim_data(csv_path) # create simulation data                    
-                    send_payload(m_tx, cols,sensor_state)  # main step
+                        cols=prep_sim_data(csv_path) # create simulation data
+                        send_payload(m_tx, cols,sensor_state)  # upload data
+                    else:
+                        # when leaving water / starting retraction:
+                        q_ble.put({"action": "FETCH"})
+                        timeout_s = time.time() + BLE_FETCH_TIMEOUT
+                        ok, cols = try_fetch_until(timeout_s, q_ble, ble_st, poll=0.3)
+                        if ok:
+                            send_payload(m_tx, cols, sensor_state)   # your main step
+                            ble_st['c_status'] = 'sent_to_gcs'
+                        else:
+                            ble_st['c_status'] = 'fetch_timeout'
+
                 if flags["cycle_deactivated"]:
                     print("EVENT: cycle_deactivated")
-
     except Exception as e:
         print(f"MAVLINK thread crashed: {e}")
         print(traceback.format_exc())
 
-# ---------------- THREAD: Bluetooth WIP -------------
-def bluetooth_thread(stop_evt, q_bt_out):
-    print("BT: starting")
-    while not stop_evt.is_set():
-        try:
-            print("dummy:connect/read real sensor")
-        except Exception as e:
-            print(f"BT thread crashed: {e}")
-            print(traceback.format_exc())
-# =========================
-# Main
+
 # =========================
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     stop_evt = threading.Event()
-    q_winch  = queue.Queue()
-
-    t_win = threading.Thread(target=winch_thread,  name="WINCH",   args=(stop_evt, q_winch, winchParms, winch_st))
-    t_mav = threading.Thread(target=mavlink_thread, name="MAVLINK", args=(stop_evt, q_winch, winchParms, winch_st))
+    q_winch  = queue.Queue()  # WINCH commands
+    q_ble    = queue.Queue()  # BLE commands
+    t_mav = threading.Thread(target=mavlink_thread, name="MAVLINK", args=(stop_evt, q_winch, q_ble, wParms, winch_st,ble_st))
+    t_win = threading.Thread(target=winch_thread,  name="WINCH", args=(stop_evt, q_winch, wParms, winch_st))
+    t_ble = threading.Thread(target=ble_thread, name="BLE", args=(stop_evt, q_ble, ble_st))
 
     def cleanup(*_):
         print("Stopping…")
         stop_evt.set()
         t_mav.join(timeout=5)
         t_win.join(timeout=5)
+        t_ble.join(timeout=5)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, cleanup)
@@ -635,7 +728,7 @@ def main():
 
     t_win.start()
     t_mav.start()
-    
+    t_ble.start()
     # main loop
     try:
         while True:
@@ -646,7 +739,5 @@ def main():
     finally:
         cleanup()
     # Wait for clean shutdown
-
 if __name__ == "__main__":
-
     main()
