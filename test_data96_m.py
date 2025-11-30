@@ -3,10 +3,10 @@ from datetime import datetime
 import sys, time, threading, struct, random
 from pymavlink import mavutil
 # --- Fixed settings ---
-#TARGET_IP   = "10.113.32.16"
-TARGET_IP   = "192.168.1.160"
+TARGET_IP   = "10.120.239.168"
+#TARGET_IP   = "192.168.1.160"
 
-TARGET_PORT = 14551
+TARGET_PORT = 14555
 SYSID       = 200
 COMPID      = 200
 HZ          = 2.0

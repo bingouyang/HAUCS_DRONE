@@ -5,8 +5,7 @@ from builtins import range
 import math
 from dataclasses import dataclass
 import signal
-
-from PyQt5.QtCore import QMutex
+from threading import Lock as QMutex
 from typing import Dict, Any
 
 import board
@@ -36,8 +35,10 @@ COPTER_MODES = {
 # testing against simulator event stream:
 #CONN_STR = 'udpin:0.0.0.0:14551'
 CONN_STR_RX = 'udpin:0.0.0.0:14551'
-CONN_STR_TX = 'udpout:10.113.32.16:14555'
+CONN_STR_TX = 'udpout:10.120.239.168:14555'
+#CONN_STR_TX = 'udpout:10.113.55.239:14555'
 #CONN_STR_TX = 'udpout:192.168.1.160:14555'
+
 # wired to Pixhawk TELEM2:
 # CONN_STR = '/dev/serial0'
 #BAUD = 115200
@@ -60,7 +61,7 @@ wParms = {
     "RELEASE_PWR": -0.4,          # release power
     "RETRACT_PWR": 0.30,          # retract power
     "PWR_LIMIT":   0.30,          # cap retract power
-    "NEUTRAL_POS": -0.04,         # adjust for servo creeping
+    "NEUTRAL_POS": -0.07,         # adjust for servo creeping
     "ROTATION_DIRECTION": -1,     # -1 or +1 depending on wiring
     "SAFETY_TIMEOUT": 0.7,
     "RETRACT_SETTLE": 50,         # tolerance near target (raw units)
@@ -72,19 +73,18 @@ wParms = {
 }
 
 #BLE parms
-BLE_POLL_SEC = 1.0
 BLE_SAMPLE_SIZE  = 120 # two min of data
 BLE_SAMPLE_TYPE  = "manual"
-BLE_FETCH_TIMEOUT = 30
+BLE_PMODE  = "high"
+BLE_FETCH_TIMEOUT = 5
 
 ble_st ={
     "ble": None,
     "ble_mutex": QMutex(),
-    'last_cols', None,
-    "gcs_ready", False,
-    "c_status", "init",
+    "last_cols": None,
+    "gcs_ready": False,
+    "c_status": "init",
 }
-##########################################
 
 # buffer json
 BUFFER_PATH = "outbox.json"
@@ -123,11 +123,11 @@ winch_st = {
 ########################## FSM triggerd by servo ##############################
 fsm_st = {
     "cycle_active": False,        # persistent: True after rising, False after falling
-    # one-shot flags (you consume & clear)
-    "deploy_needed": False,       # set on rising edge
-    "send_to_gcs_needed": False,  # set on falling edge
     "cycle_activated": False,     # set when cycle_active becomes True
     "cycle_deactivated": False,   # set when cycle_active becomes False
+    
+    "deploy_needed": False,       # set on rising edge
+    "send_to_gcs": False,         # set on falling edge
     # internals (private)
     "_last_pwm": None,
     "_last_rel_t": 0.0,
@@ -155,45 +155,12 @@ def _servo_out_value(msg, ch):
     return getattr(msg, f"servo{idx}_raw", None)
 
 def fsm_consume_flags(fsm):
-    """Read & clear one-shot flags."""
-    keys = ("deploy_needed", "send_to_gcs_needed", "cycle_activated", "cycle_deactivated")
+    #Read & clear one-shot flags.
+    keys = ("deploy_needed", "send_to_gcs", "cycle_activated", "cycle_deactivated")
     out = {k: fsm.get(k, False) for k in keys}
     for k in keys:
         fsm[k] = False
     return out
-
-def on_rising_edge(fsm, dwell_s=None, now=None):
-    """
-    Rising edge servo signal:
-      - mark cycle active
-      - raise deploy_needed
-    """
-    fsm["cycle_active"] = True
-    fsm["deploy_needed"] = True
-
-def on_airborne_true(fsm):
-    """
-    First transition to airborne during an active cycle:
-      - raise ble_upload_needed once per cycle
-    """
-    if fsm["cycle_active"] and not fsm["ble_started"]:
-        fsm["ble_started"] = True
-        fsm["ble_upload_needed"] = True
-
-def on_falling_edge(fsm):
-    """
-    Falling edge of servo signal:
-      - raise send_to_gcs_needed
-      - reset persistent cycle state
-    """
-    fsm["send_to_gcs_needed"] = True
-    fsm_reset_cycle(fsm)
-
-def fsm_reset_cycle(fsm):
-    #Reset persistent state
-    fsm["cycle_active"] = False
-    fsm["ble_started"] = False
-    fsm["retract_deadline"] = None
 
 def handle_servo_output_raw(msg, fsm,
                             ch=TRIGGER_CH,
@@ -229,9 +196,8 @@ def handle_servo_output_raw(msg, fsm,
             if fsm["cycle_active"]:
                 fsm["cycle_active"] = False
                 fsm["cycle_deactivated"] = True
-            fsm["send_to_gcs_needed"] = True
+            fsm["send_to_gcs"] = True
             print("falling edge detected")
-
     fsm["_last_pwm"] = pwm
 
 ############################################################################
@@ -240,7 +206,6 @@ def process_heartbeat(msg, st):
     base_mode = getattr(msg, 'base_mode', 0)
     custom_mode_id = msg.custom_mode
     custom_mode_name = COPTER_MODES.get(custom_mode_id, f"UNKNOWN({custom_mode_id})")
-    #print(f"custom_mode_id:{custom_mode_id} custom_mode: {custom_mode_name}")
     armed = bool(base_mode & NAV_SAFETY_ARMED)
     if st['armed'] is None:
         st['armed'] = armed
@@ -256,11 +221,9 @@ def process_heartbeat(msg, st):
     st['auto_mode']=True  # or False ???????????????????????????????????????
     # check if the drone is currently in manual mode 
     if custom_mode_name in ['RTL', 'ACRO', 'ALT_HOLD', 'STABILIZE','LOITER','MANUAL','Unknown']:
-        #print(f"Current mode: {custom_mode_name} - (Manual), don't deploy winch")
         st['auto_mode']=False
     else: # this should be auto mode
         st['auto_mode']=True
-        #print(f"Current mode: {custom_mode_name}")
 
 def process_statustext(txt, st):
     """expecting a final touchdown."""
@@ -269,71 +232,6 @@ def process_statustext(txt, st):
     s = txt.lower()
     if "mission" in s and "complete" in s:
         st['awaiting_final_td'] = True
-
-def handle_extsys_event(landed_state, st, need_confirm=2):
-    """
-    Returns one of: INIT_TAKEOFF, TAKEOFF, LANDING_START, TOUCHDOWN, TOUCHDOWN_FINAL, or None.
-    - LANDING_START - descent when state enters LANDING.
-    - TOUCHDOWN - ground contact (rate-proof via consecutive ON_GROUND).
-    """
-    last = st['last_landed']
-    evt = None
-
-    # --- LANDING start (edge) ---
-    if landed_state == NAV_LANDING and last != NAV_LANDING:
-        # Only treat as sampling if we are NOT expecting the final touchdown
-        if not st['awaiting_final_td'] and not st['landing_fired']:
-            evt = "LANDING_START"          # <-- use this to start sampling
-            st['landing_fired'] = True
-
-    # --- ON_GROUND counting for touchdown ---
-    if landed_state == NAV_ON_GROUND:
-        st['og_count'] = st['og_count'] + 1 if last == NAV_ON_GROUND else 1
-        st['ground_ready'] = True
-        if not st['td_fired'] and st['og_count'] >= need_confirm:
-            if st['awaiting_final_td'] or st['auto_mode']==False: # if we are not 
-                evt = "TOUCHDOWN_FINAL"
-                print("final landed or not in AUTO mode, don't deploy winch")
-            elif st['auto_mode']==True: # only do this if we are in auto mode.
-                evt = "TOUCHDOWN"
-                print("sampling landed in AUTO mode, deploy winch")
-            st['td_fired'] = True
-            # if this was final TD, prep next mission to start fresh
-            if st['awaiting_final_td']:
-                st['seen_init'] = False
-                st['awaiting_final_td'] = False
-                st['ground_ready'] = True
-    else:
-        # left ground → allow next touchdown to fire again
-        st['og_count'] = 0
-        if st['td_fired']:
-            st['td_fired'] = False
-
-    # Reset LANDING gate when we leave LANDING (so it can fire next time)
-    if last == NAV_LANDING and landed_state != NAV_LANDING:
-        st['landing_fired'] = False
-
-    # --- liftoff  ---
-    if landed_state == NAV_IN_AIR and last != NAV_IN_AIR:
-        if not st['seen_init'] and st['ground_ready']:
-            evt = "INIT_TAKEOFF"
-            st['seen_init']   = True
-            st['ground_ready'] = False
-        else:
-            evt = "TAKEOFF"
-
-    st['last_landed'] = landed_state
-    return evt
-
-######################
-# BLE initialization
-def init_sensor_status(ble):
-    ble.set_calibration_pressure()
-    ble.get_init_do()
-    ble.get_init_pressure()
-    ble.get_battery()
-    ble.get_sampling_rate()
-    ble.set_threshold(BLE_SAMPLING_END) # initialize threshold to artificially high 
 
 # =========================
 # Winch helpers
@@ -372,8 +270,6 @@ def retract_adpative(servo, adc, cfg, st):
     """
     servo retract toward HALL_TARGET, reducing power when getting close to HALL_TARGET.
     """  
-    #print("Retract")
-
     try:
         dist = hall_raw(adc) - cfg["HALL_TARGET"]
     except Exception:
@@ -400,7 +296,7 @@ def retract_adpative(servo, adc, cfg, st):
         # already retracted: ensure neutral if still pushing inward
         if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
             neutral(servo, cfg)
-    elif (dist < 10_000) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0): # target is far and winch is being retracted
+    elif (dist < 10000) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0): # target is far and winch is being retracted
         # keep retracting with bounded power
         servo.value = cfg["ROTATION_DIRECTION"] *  pwr + cfg["NEUTRAL_POS"]
     elif dist > cfg["RETRACT_TH"]: # if distance is long but servo is not rotating in the right direction(?) 
@@ -424,43 +320,19 @@ def _servo_out_value(msg, ch):
 def _broadcast(x, n):
     return [] if n <= 0 else [x] * n
 
-def try_fetch_until(timeout_s: float, q_ble, _st, poll=0.2):
-    """
-    asking BLE to FETCH until _st['gcs_ready'] or timeout.
-    """
-    while time.time() < timeout_s:
-        # Only ask to fetch when connected (saves BLE spam)
-        if _st.get('connected'):
-            q_ble.put({"cmd": "FETCH"})
-        # Wait a bit for the BLE thread to run get_sample_data()
-        t0 = time.time()
-        while time.time() - t0 < poll:
-            if _st.get("gcs_ready"):
-                cols = _st["last_cols"]
-                _st["gcs_ready"] = False
-                return True, cols
-            time.sleep(0.05)
-        # otherwise loop and try again
-    return False, None
+# use simulator to generate data
+data_sim_flag = False
+adc_sim_flag = 1 # hall effect sensor using ADC simulator
 
-# use mavlink simulator
-mav_sim_flag = 1
-# using ADC simulator
-adc_sim_flag = 1
 # =========================
 def winch_thread(stop_evt, q_winch, cfg, st):
-    try:
-        # setup servo
-        # if sim_flag == 1: 
-        #     servo = ServoSim()  # to use servo simulator
-        # else:    
+    try:  
         servo=Servo(cfg["SERVO_PIN"],
             min_pulse_width=0.0009,
             max_pulse_width=0.0021,
             frame_width=0.02,
             pin_factory=PiGPIOFactory(),
             initial_value=cfg["NEUTRAL_POS"])  # try neutral
-        print(f"initialize servo power to neutral:{cfg['NEUTRAL_POS']}")
     except Exception as e:
         print(f"Servo init failed: {e}")
         return
@@ -525,94 +397,138 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
     finally:
         neutral(servo, cfg)
-        time.sleep(0.2)
+        time.sleep(0.1)
 
-def ble_thread(stop_evt, q_ble, st):
-    poll_sec   = BLE_POLL_SEC
-    ble = st['ble'] = BluetoothReader(st['mutex'])
+########################################################        
+def ble_thread(stop_evt, q_ble, q_mav, st):
+    ble = st['ble'] = BluetoothReader(st['ble_mutex'])
 
-    if ble.connect():
-        st['c_status'] = 'connected'
-        try:
-            #initialize sampling size (120) and type (manual).
-            ble.init_sensor_status(BLE_SAMPLE_SIZE, BLE_SAMPLE_TYPE)
-        except Exception:
-            st['c_status'] = 'connected_no_inits'
-    else:
+    try:
         st['c_status'] = 'disconnected'
-    # retry till connect
-    last_poll = 0.0
-    while not stop_evt.is_set():
-        now = time.time()
-        # periodic connection maintenance (fixed-rate retry)
-        if now - last_poll >= poll_sec:
-            last_poll = now
+        while ble is None or not ble.check_connection_status():
+            if ble.connect():
+                ble.set_lights('navigation')
+                logger.debug('connected to sensor, activated lights')
+            ble.init_sensor_status()
+            time.sleep(0.2)
+            ble.set_calibration_pressure()
+            time.sleep(0.2)
+            #ble.set_maxsize(BLE_SAMPLE_SIZE)
+            print (f"set smple_type:{BLE_SAMPLE_TYPE}")
+            ble.set_smpl_type(BLE_SAMPLE_TYPE)
+            time.sleep(0.1)
+            st['c_status'] = 'connected'
+        # retry till connect
+        last_poll = 0.0
+        while not stop_evt.is_set():
+            time.sleep(0.2)
+            now = time.time()
+            # periodic connection maintenance (fixed-rate retry)
+            if now - last_poll >= 1:
+                last_poll = now
+                try:
+                    ok = bool(ble.check_connection_status())
+                except Exception:
+                    ok = False
+                if not ok:
+                    st['c_status']  = 'disconnected'
+                    try:
+                        if ble.reconnect():
+                            st['c_status']  = 'connected'
+                    except Exception:
+                        pass
+                else:
+                    st['c_status']  = 'connected'
+                        # Handle queued commands
             try:
-                ok = bool(ble.check_connection_status())
-            except Exception:
-                ok = False
-            if not ok:
-                st['c_status']  = 'disconnected'
-                try:
-                    if ble.reconnect():
-                        st['c_status']  = 'connected'
-                except Exception:
-                    pass
-            else:
-                st['c_status']  = 'connected'
-        # Handle queued commands
-        try:
-            cmd = q_ble.get(timeout=0.1)
-        except queue.Empty:
-            continue
-        
-        action = (cmd.get('cmd') or '').upper()
-        if action == 'START':
-            if ble.sdata.get('connection')::
-                try:
-                    # reset sampling counter
-                    ble.set_sample_reset()     
-                    st['sampling'] = True
-                    st['c_status'] = 'sampling_started'  # or 'reset_done'
-                except Exception:
-                    st['c_status'] = 'start_failed'
-            else:
-                st['c_status'] = 'start_skipped_disconnected'
-        elif action == 'FETCH':
-            if st['connected']:
-                try:
-                    # set the threshold high to stop sampling
-                    ok = bool(ble.get_sample_data())
-                    st['sampling'] = False
-                    if ok:
-                        do_list   = ble.sdata.get('do_vals')        or []
-                        temp_list = ble.sdata.get('temp_vals')      or []
-                        press_list= ble.sdata.get('pressure_vals')  or []
-                        n = len(do_list)         # sample length
-                        ts_list = list(range(n)) # generate sampling order
-
-                        st['last_cols'] = {
-                            'time': ts_list,
-                            'do': do_list,
-                            'temp': temp_list,
-                            'press': press_list,
-                            # broadcast scalars to length n
-                            'init_DO':       _broadcast(ble.sdata.get('init_do'), n),
-                            'init_pressure': _broadcast(ble.sdata.get('init_pressure'), n),
-                            'batt_v':        _broadcast(ble.sdata.get('battv'), n),
-                        }
-                        st['gcs_ready'] = True
-                        st['c_status']  = 'fetched'
-                        # optional: ble.set_sample_reset()  # if you want to immediately start a fresh run
+                cmd = q_ble.get(timeout=0.25)
+                print(f"cmd:{cmd}")
+            except queue.Empty:
+                cmd = None
+            if cmd:
+                action = (cmd.get("action") or "").upper()
+                if action == 'START':
+                    print("BLE action:START")
+                    if ble.sdata.get('connection'): 
+                        try:
+                            # reset sampling counter
+                            ble.set_sample_reset()
+                            ble.set_sampl_flag(1) # set low threhold to start sampling
+                            sflag= ble.get_sampl_flag()
+                            print(f"start sampling, sampling flag: {sflag}")
+                            s_type=ble.get_smpl_type()
+                            print(f"sample_type:{s_type}")
+                            st['sampling'] = True
+                            st['c_status'] = 'sampling_started'  # or 'reset_done'                       
+                        except Exception:
+                            st['c_status'] = 'start_failed'
                     else:
-                        st['c_status'] = 'fetch_empty'
-                except Exception:
-                    st['c_status'] = 'fetch_failed'
-            else:
-                st['c_status'] = 'fetch_skipped_disconnected'
+                        st['c_status'] = 'start_skipped_disconnected'
+                elif action == 'FETCH':
+                    print(f"BLE action:FETCH: {ble.sdata.get('connection')}")
+                    if ble.sdata.get('connection'):
+                        try:
+                            ble.set_sampl_flag(0) # stop sampling
+                            time.sleep(0.1)
+                            sflag= ble.get_sampl_flag()
+                            print(f"stop sampling sampling flag: {sflag}")
+                            s_size=ble.get_sample_size()
+                            ok = bool(ble.get_sample_data())
+                            st['sampling'] = False
+                            print(f"finish sampling - queue mav cmd to upload data, ok: {ok}, sample_size:{s_size}")
+                            if ok:
+                                do_list   = ble.sdata.get('do_vals')        or []
+                                temp_list = ble.sdata.get('temp_vals')      or []
+                                press_list= ble.sdata.get('pressure_vals')  or []
+                                n = len(do_list)         # sample length
+                                print(f"sampling finished, length:{n}")
+                                ts_list = list(range(n)) # generate sampling order
+
+                                st['last_cols'] = {
+                                    'time': ts_list,'do': do_list,'temp': temp_list,'press': press_list,
+                                    'init_DO':       _broadcast(ble.sdata.get('init_do'), n),
+                                    'init_pressure': _broadcast(ble.sdata.get('init_pressure'), n),
+                                    'batt_v':        _broadcast(ble.sdata.get('battv'), n),
+                                }
+                                st['gcs_ready'] = True
+                                st['c_status']  = 'fetched'
+                                q_mav.put({"action": "sendpayload"}) # set winch to neutral at the end of a cycle
+                            else:
+                                st['c_status'] = 'fetch_empty'
+                        except Exception as e:
+                            st['c_status'] = 'fetch_failed'
+                            print(f"fetch failed: {e}")
+                    else:
+                        st['c_status'] = 'fetch_skipped_disconnected'
+    
+                elif action == 'DISCONNECT':
+                    _ble_close(ble)
+                    st['c_status'] = 'disconnected_by_request'
+    except Exception as e:
+        print(f"BLE thread crashed: {e}")
+
+    finally:
+        print("BLE thread close")
+        _ble_close(ble)   # <-- guarantees graceful shutdown on Ctrl+C
+
+def _ble_close(ble):
+    # Stop scanning if in progress
+    try: ble.stop_scan()
+    except Exception: pass
+    # Disconnect if connected
+    try:
+        conn = getattr(ble, "uart_connection", None)
+        if conn and getattr(conn, "connected", False):
+            conn.disconnect()
+    except Exception: pass
+    # Clear flag for your code’s single source of truth
+    try:
+        ble.sdata['connection'] = False
+    except Exception:
+        pass
 
 # ---------------- THREAD: MAVLink ----------------
-def mavlink_thread(stop_evt, q_winch, q_ble, wincfg, winst,blest):
+def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst,blest):
     # initialize failed flag on startup
     if "failed" not in sensor_state:
         sensor_state["failed"] = load_buffer(BUFFER_PATH)
@@ -653,22 +569,17 @@ def mavlink_thread(stop_evt, q_winch, q_ble, wincfg, winst,blest):
 
             elif t == 'HEARTBEAT':
                 process_heartbeat(msg, mv_state)
-                
-            elif t == 'EXTENDED_SYS_STATE':
-                evt = handle_extsys_event(msg.landed_state, mv_state, need_confirm=2)
-                if evt == "TOUCHDOWN_FINAL":
-                    print("EVENT: FINAL TOUCHDOWN")
-                    q_winch.put({"action": "NEUTRAL"}) # set winch to neutral
-            
+
             elif t == 'SERVO_OUTPUT_RAW':
                 handle_servo_output_raw(msg, fsm_st)
-                # Consume exactly once per loop; this clears the one-shot flags
                 flags = fsm_consume_flags(fsm_st)
                 if flags["cycle_activated"]:
                     pass
-                    # inform BT
+                
                 if flags["deploy_needed"]:
-                    print("EVENT: start BT sampling")                    
+                    #Start BLE Sampling
+                    print("EVENT: start BLE sampling")
+                    q_ble.put({"action": "START"})
                     #engage winch                    
                     q_winch.put({"action": "RELEASE"})
                     # schedule retract without blocking MAVLink loop
@@ -680,29 +591,35 @@ def mavlink_thread(stop_evt, q_winch, q_ble, wincfg, winst,blest):
                     _pending_retract_timer.daemon = True
                     _pending_retract_timer.start()
 
-                if flags["send_to_gcs_needed"]:
+                if flags["send_to_gcs"]:
                     sensor_state["failed"] = resend_buffer(m_tx, sensor_state.get("failed", {}))
-                    # Request data from BL sensor
-                    if mav_sim_flag == True:
+                    # Upload simulator data
+                    if data_sim_flag == True:
                         cols=prep_sim_data(csv_path) # create simulation data
                         send_payload(m_tx, cols,sensor_state)  # upload data
                     else:
-                        # when leaving water / starting retraction:
+                        print("MAV->BL: To fetch data from BL sensor")
                         q_ble.put({"action": "FETCH"})
-                        timeout_s = time.time() + BLE_FETCH_TIMEOUT
-                        ok, cols = try_fetch_until(timeout_s, q_ble, ble_st, poll=0.3)
-                        if ok:
-                            send_payload(m_tx, cols, sensor_state)   # your main step
-                            ble_st['c_status'] = 'sent_to_gcs'
-                        else:
-                            ble_st['c_status'] = 'fetch_timeout'
-
                 if flags["cycle_deactivated"]:
                     print("EVENT: cycle_deactivated")
+                    q_winch.put({"action": "NEUTRAL"}) # set winch to neutral at the end of a cycle
+            
+            # process any queued action (mainly from BLE thread
+            try:
+                cmd = q_mav.get(timeout=0.1)
+                print(f"cmd:{cmd}")
+            except queue.Empty:
+                continue
+            action = (cmd.get("action") or "").upper()
+            print(f"mav action:{action}")
+            if action == 'SENDPAYLOAD': 
+                cols = blest["last_cols"]
+                print(f"Uploading fetched BL data: cols:{cols}")
+                send_payload(m_tx, cols,sensor_state)  # upload data
+            
     except Exception as e:
         print(f"MAVLINK thread crashed: {e}")
         print(traceback.format_exc())
-
 
 # =========================
 def main():
@@ -711,16 +628,19 @@ def main():
     stop_evt = threading.Event()
     q_winch  = queue.Queue()  # WINCH commands
     q_ble    = queue.Queue()  # BLE commands
-    t_mav = threading.Thread(target=mavlink_thread, name="MAVLINK", args=(stop_evt, q_winch, q_ble, wParms, winch_st,ble_st))
-    t_win = threading.Thread(target=winch_thread,  name="WINCH", args=(stop_evt, q_winch, wParms, winch_st))
-    t_ble = threading.Thread(target=ble_thread, name="BLE", args=(stop_evt, q_ble, ble_st))
+    q_mav    = queue.Queue()  # MAV commands
+    
+    t_mav = threading.Thread(target=mav_thread, name="MAVLINK", args=(stop_evt, q_winch, q_ble, q_mav, wParms, winch_st,ble_st))
+    t_win = threading.Thread(target=winch_thread, name="WINCH", args=(stop_evt, q_winch, wParms, winch_st))
+    t_ble = threading.Thread(target=ble_thread, name="BLE", args=(stop_evt, q_ble, q_mav, ble_st))
 
     def cleanup(*_):
         print("Stopping…")
         stop_evt.set()
-        t_mav.join(timeout=5)
-        t_win.join(timeout=5)
-        t_ble.join(timeout=5)
+        q_ble.put({"action": "DISCONNECT"})
+        t_mav.join(timeout=1)
+        t_win.join(timeout=0.5)
+        t_ble.join(timeout=0.5)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, cleanup)
