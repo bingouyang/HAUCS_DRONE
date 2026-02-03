@@ -86,7 +86,7 @@ class BluetoothReader(QObject):
         connection_success = False
         try:
             for adv in self.ble.start_scan(ProvideServicesAdvertisement):
-                print(f"current adv: {adv.complete_name}")
+                #print(f"current adv: {adv.complete_name}")
                 if UARTService in adv.services:
                     logger.debug(f"found sensor with UART service {adv.complete_name}")
                     print(f"found sensor with UART service {adv.complete_name}")
