@@ -35,7 +35,7 @@ COPTER_MODES = {
 # testing against simulator event stream:
 #CONN_STR = 'udpin:0.0.0.0:14551'
 CONN_STR_RX = 'udpin:0.0.0.0:14551' #from PC
-CONN_STR_TX = 'udpout:172.19.38.168:14555' #to PC (used mobile hotspot...)
+CONN_STR_TX = 'udpout:10.113.32.16:14555' #to PC (used mobile hotspot...) 
 #CONN_STR_TX = 'udpout:10.113.55.239:14555'
 #CONN_STR_TX = 'udpout:192.168.1.160:14555'
 

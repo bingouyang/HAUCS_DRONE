@@ -5,7 +5,7 @@ Pi → PC test:
 - sends a few DATA96 frames (var_id=1 → DO) for your module to decode/print
 
 Run:
-  python3 test_data96_with_heartbeat.py <PC_IP> [14551]
+  python3 test_data96.py <PC_IP> [14551]
 """
 
 import sys, time, threading, struct, random
