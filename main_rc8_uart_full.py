@@ -14,6 +14,7 @@ import board
 import busio
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
+
 from gpiozero.pins.pigpio import PiGPIOFactory
 from gpiozero import Servo
 
@@ -373,7 +374,8 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         else:
             i2c = busio.I2C(board.SCL, board.SDA)
             ads = ADS.ADS1115(i2c)
-            adc = AnalogIn(ads, ADS.P0)
+            #adc = AnalogIn(ads, ADS.P0)
+            adc = AnalogIn(ads, 0)
     except Exception as e:
         print("ADS1115 init failed: %s" % e)
         return
