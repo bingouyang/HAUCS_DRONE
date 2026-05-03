@@ -2,4 +2,5 @@
 *.log
 *.txt
 *.csv
+*.pyc
 fb_key.json
