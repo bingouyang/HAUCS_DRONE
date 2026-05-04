@@ -24,6 +24,10 @@ from bt_helper import *
 
 from adc_sim import ServoSim, LinkedHallADC
 
+# simulator flags
+data_sim_flag = False
+adc_sim_flag = 1
+
 COPTER_MODES = {
     0: "STABILIZE",
     1: "ACRO",
@@ -53,14 +57,13 @@ COPTER_MODES = {
 }
 
 # ---------------- CONFIG ----------------
-
 # Primary flight controller link: Pi to Cube Orange over UART
 FC_CONN_STR = "/dev/serial0"
 FC_BAUD = 115200
 
 # Optional forwarding to PC or GCS
 # Set to None to disable
-GCS_UDP_OUT = "udpout:10.113.32.16:14555"
+GCS_UDP_OUT = None
 
 # Mavlink constants
 NAV_IN_AIR = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
@@ -167,14 +170,12 @@ def rc_channel_value(msg, ch):
         return None
     return getattr(msg, "chan%d_raw" % ch, None)
 
-
 def fsm_consume_flags(fsm):
     keys = ("deploy_needed", "send_to_gcs", "cycle_activated", "cycle_deactivated")
     out = {k: fsm.get(k, False) for k in keys}
     for k in keys:
         fsm[k] = False
     return out
-
 
 def handle_rc_channels(
     msg,
@@ -185,7 +186,6 @@ def handle_rc_channels(
     debounce_s=DEBOUNCE_S,
 ):
     pwm = rc_channel_value(msg, ch)
-
     if pwm is None:
         print("RC%d is not present in this RC_CHANNELS message" % ch)
         return
@@ -264,7 +264,6 @@ def hall_raw(c):
     else:
         return int(c.value)
 
-
 def release_win(servo, adc, cfg, st, stop_evt):
     servo.value = -cfg["ROTATION_DIRECTION"] * abs(cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
@@ -339,21 +338,20 @@ def broadcast_value(x, n):
     return [] if n <= 0 else [x] * n
 
 
-# simulator flags
-data_sim_flag = False
-adc_sim_flag = 0
-
-
 def winch_thread(stop_evt, q_winch, cfg, st):
     try:
-        servo = Servo(
-            cfg["SERVO_PIN"],
-            min_pulse_width=0.0009,
-            max_pulse_width=0.0021,
-            frame_width=0.02,
-            pin_factory=PiGPIOFactory(),
-            initial_value=cfg["NEUTRAL_POS"],
-        )
+        # setup servo
+        if adc_sim_flag == 1: 
+            servo = ServoSim()  # to use servo simulator
+        else:
+            servo = Servo(
+                cfg["SERVO_PIN"],
+                min_pulse_width=0.0009,
+                max_pulse_width=0.0021,
+                frame_width=0.02,
+                pin_factory=PiGPIOFactory(),
+                initial_value=cfg["NEUTRAL_POS"],
+            )
     except Exception as e:
         print("Servo init failed: %s" % e)
         return
@@ -374,7 +372,6 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         else:
             i2c = busio.I2C(board.SCL, board.SDA)
             ads = ADS.ADS1115(i2c)
-            #adc = AnalogIn(ads, ADS.P0)
             adc = AnalogIn(ads, 0)
     except Exception as e:
         print("ADS1115 init failed: %s" % e)
