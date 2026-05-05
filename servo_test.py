@@ -45,21 +45,19 @@ try:
                 v = max(-1.0, v - STEP)
             elif ch.lower() == 'd':
                 v = min(+1.0, v + STEP)
-            elif ch.lower() == 's':
-                if v > 0: 
-                    v = max(0.0, v - STEP)
-                elif v < 0: 
-                    v = min(0.0, v + STEP)
+            elif ch.lower() == 'r':
+                v=0.4
+            elif ch.lower() == 'v':
+                v=-0.12               
             elif ch.lower() == 'z':
                 v = 0.0
 
             srv.value = v
-            print(f"value={v:+.3f}  ~ {value_to_usec(v)} µs", end='\r', flush=True)
-
+            print(f"value={v:+.3f}  ~ {value_to_usec(v)} us", end='\r', flush=True)
 except KeyboardInterrupt:
     pass
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     srv.detach()  # stop driving pulses
     print("\n\nDone.")
-    print(f"Suggested NEUTRAL ≈ value={v:+.3f}  (~{value_to_usec(v)} µs)")
+    print(f"Suggested NEUTRAL approx value={v:+.3f}  (~{value_to_usec(v)} us)")

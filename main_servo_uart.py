@@ -79,7 +79,7 @@ wParms = {
     "RELEASE_PWR": -0.4,
     "RETRACT_PWR": 0.30,
     "PWR_LIMIT": 0.30,
-    "NEUTRAL_POS": -0.07,
+    "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
     "SAFETY_TIMEOUT": 0.7,
     "RETRACT_SETTLE": 50,

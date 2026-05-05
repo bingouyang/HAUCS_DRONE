@@ -26,7 +26,7 @@ from adc_sim import ServoSim, LinkedHallADC
 
 # simulator flags
 data_sim_flag = False
-adc_sim_flag = 1
+adc_sim_flag = 0
 
 COPTER_MODES = {
     0: "STABILIZE",
@@ -80,12 +80,12 @@ wParms = {
     "HALL_MIN": 1035,
     "HALL_MAX": 12285,
     "HALL_TARGET": 1035,
-    "RELEASE_PWR": -0.4,
     "RETRACT_PWR": 0.30,
-    "PWR_LIMIT": 0.30,
-    "NEUTRAL_POS": -0.07,
+    "RELEASE_PWR": -0.40,
+    "PWR_LIMIT": 0.2,
+    "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
-    "SAFETY_TIMEOUT": 0.7,
+    "SAFETY_TIMEOUT": 5,
     "RETRACT_SETTLE": 50,
     "RETRACT_TH": 8000,
     "PWD_ADP_TH": 10000,
@@ -149,7 +149,9 @@ fsm_st = {
     "cycle_activated": False,
     "cycle_deactivated": False,
     "deploy_needed": False,
+    "deploy_allowed": True,
     "send_to_gcs": False,
+    "deploy_in_progress": False,
     "_last_pwm": None,
     "_last_rel_t": 0.0,
     "_last_ret_t": 0.0,
@@ -200,8 +202,6 @@ def handle_rc_channels(
     else:
         state = "MID"
 
-    #print("RC%d PWM: %s -> %s" % (ch, pwm, state))
-
     now_m = time.monotonic()
     last_pwm = fsm["_last_pwm"]
 
@@ -221,7 +221,7 @@ def handle_rc_channels(
                 fsm["cycle_deactivated"] = True
             fsm["send_to_gcs"] = True
             print("RC falling edge detected")
-
+            #print("RC%d PWM: %s -> %s" % (ch, pwm, state))
     fsm["_last_pwm"] = pwm
 
 def process_heartbeat(msg, st):
@@ -249,14 +249,12 @@ def process_heartbeat(msg, st):
     else:
         st["auto_mode"] = True
 
-
 def process_statustext(txt, st):
     if not txt:
         return
     s = txt.lower()
     if "mission" in s and "complete" in s:
         st["awaiting_final_td"] = True
-
 
 def hall_raw(c):
     if adc_sim_flag == 1:
@@ -265,35 +263,34 @@ def hall_raw(c):
         return int(c.value)
 
 def release_win(servo, adc, cfg, st, stop_evt):
-    servo.value = -cfg["ROTATION_DIRECTION"] * abs(cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
+    svalue= cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
-    print("Release, winch servo open: %s" % servo.value)
-
+    print("Release, winch servo open: %s" % svalue)
+    servo.value = float(svalue)
+    
     while not stop_evt.is_set():
         if (time.time() - t0) > cfg["SAFETY_TIMEOUT"]:
             neutral(servo, cfg)
             print("safety timeout triggered during release")
             break
-
         try:
             dist = hall_raw(adc) - cfg["HALL_TARGET"]
         except Exception:
             neutral(servo, cfg)
             time.sleep(0.25)
             break
-
+        print("currnt dist: %s" % dist)
         if dist > cfg["RETRACT_TH"]:
             st["RETRACTED"] = 0
             break
 
         time.sleep(0.25)
-
     neutral(servo, cfg)
-
 
 def retract_adaptive(servo, adc, cfg, st):
     try:
         dist = hall_raw(adc) - cfg["HALL_TARGET"]
+
     except Exception:
         neutral(servo, cfg)
         time.sleep(0.25)
@@ -301,6 +298,8 @@ def retract_adaptive(servo, adc, cfg, st):
 
     pwr = dist / float(cfg["HALL_MAX"] - cfg["HALL_MIN"])
     pwr = pwr * cfg["PWR_LIMIT"]
+    print("currnt adaptive dist: %s" % dist)
+    #print("currnt adaptive pwr: %s" % pwr)
 
     if pwr > 0.0:
         pwr = math.pow(pwr, 1.0 / 3.0)
@@ -313,6 +312,8 @@ def retract_adaptive(servo, adc, cfg, st):
     if dist < (cfg["HALL_TARGET"] + cfg["RETRACT_SETTLE"]):
         if st["RETRACTED"] != 1:
             st["RETRACTED"] = 1
+            fsm_st["deploy_allowed"] = True
+            print("Deploy re-enabled (fully retracted)")
             if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
                 neutral(servo, cfg)
             return True
@@ -329,14 +330,12 @@ def retract_adaptive(servo, adc, cfg, st):
 
     return False
 
-
 def neutral(servo, cfg):
     servo.value = cfg["NEUTRAL_POS"]
-
+    print('inside neutral')
 
 def broadcast_value(x, n):
     return [] if n <= 0 else [x] * n
-
 
 def winch_thread(stop_evt, q_winch, cfg, st):
     try:
@@ -378,7 +377,6 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         return
 
     print("winch ready")
-
     try:
         while not stop_evt.is_set():
             try:
@@ -388,22 +386,26 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
             if cmd:
                 act = (cmd.get("action") or "").upper()
-
                 if act == "RELEASE":
                     release_win(servo, adc, cfg, st, stop_evt)
 
-                elif act == "RETRACT":
+                elif act == "RETRACT":                    
                     dur = float(cmd.get("duration", 0.0))
                     print("RETRACT for %ss" % dur)
                     t0 = time.time()
                     servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"]
+                    print("servo.value %s" % servo.value)
+                    time.sleep(0.5)
 
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
+                            print("Fully retractd!")
                             break
                         time.sleep(0.05)
-
+                    if (time.time() - t0) >= dur:
+                        print("WARNING: Retract timeout, not fully retracted, future release prevented for now")
+                    
                     neutral(servo, cfg)
 
                 elif act == "NEUTRAL":
@@ -418,7 +420,6 @@ def winch_thread(stop_evt, q_winch, cfg, st):
     finally:
         neutral(servo, cfg)
         time.sleep(0.1)
-
 
 def ble_thread(stop_evt, q_ble, q_mav, st):
     ble = st["ble"] = BluetoothReader(st["ble_mutex"])
@@ -594,8 +595,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
         last_ping = time.time()
 
         while not stop_evt.is_set():
-            # CHANGED: For debugging and control, block specifically on RC_CHANNELS.
-            # This prevents printing every MAVLink message and makes missing RC stream obvious.
+
             msg = m_fc.recv_match(type="RC_CHANNELS", blocking=True, timeout=2)
 
             if msg is None:
@@ -608,20 +608,25 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     pass
 
                 if flags["deploy_needed"]:
-                    print("EVENT: start BLE sampling")
-                    q_ble.put({"action": "START"})
-                    q_winch.put({"action": "RELEASE"})
+                    if not fsm_st["deploy_allowed"] or winst["RETRACTED"] != 1:
+                        print("Deploy ignored: not allowed or not retracted")
+                    else:
+                        fsm_st["deploy_allowed"] = False   # lock it immediately
 
-                    freefall_sec = wincfg["FREEFALL_SEC"]
-                    retract_sec = wincfg["RETRACT_SEC"]
+                        print("EVENT: start BLE sampling")
+                        q_ble.put({"action": "START"})
+                        q_winch.put({"action": "RELEASE"})
 
-                    def enqueue_retract():
-                        q_winch.put({"action": "RETRACT", "duration": retract_sec})
+                        freefall_sec = wincfg["FREEFALL_SEC"]
+                        retract_sec = wincfg["RETRACT_SEC"]
 
-                    pending_retract_timer = threading.Timer(freefall_sec, enqueue_retract)
-                    pending_retract_timer.daemon = True
-                    pending_retract_timer.start()
+                        def enqueue_retract():
+                            q_winch.put({"action": "RETRACT", "duration": retract_sec})
 
+                        pending_retract_timer = threading.Timer(freefall_sec, enqueue_retract)
+                        pending_retract_timer.daemon = True
+                        pending_retract_timer.start()
+                 
                 if flags["send_to_gcs"]:
                     sensor_state["failed"] = resend_buffer(payload_link, sensor_state.get("failed", {}))
 
