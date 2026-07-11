@@ -310,7 +310,7 @@ class BluetoothReader(QObject):
                 msg = msg.lower()
                 msg = msg.split(",")
                 logger.info(f"ble incoming msg: {msg}, command:{command}")
-                #print(f"ble incoming msg: {msg}, command:{command}")
+                print(f"ble incoming msg: {msg}, command:{command}")
                 # check message length if defined
                 if command.get('size'):
                     if command.get('size') != len(msg):

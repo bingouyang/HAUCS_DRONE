@@ -14,6 +14,7 @@ import board
 import busio
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
+
 from gpiozero.pins.pigpio import PiGPIOFactory
 from gpiozero import Servo
 
@@ -22,6 +23,10 @@ from encoder_helper import *
 from bt_helper import *
 
 from adc_sim import ServoSim, LinkedHallADC
+
+# simulator flags
+data_sim_flag = False
+adc_sim_flag = 0
 
 COPTER_MODES = {
     0: "STABILIZE",
@@ -52,7 +57,6 @@ COPTER_MODES = {
 }
 
 # ---------------- CONFIG ----------------
-
 # Primary flight controller link: Pi to Cube Orange over UART
 FC_CONN_STR = "/dev/serial0"
 FC_BAUD = 115200
@@ -73,15 +77,14 @@ TOUCH_CONFIRM_SEC = 2
 wParms = {
     "SERVO_PIN": 17,
     "ADC_PIN": 0,
-    "HALL_MIN": 1035,
+    "HALL_MIN": 2500,
     "HALL_MAX": 12285,
-    "HALL_TARGET": 1035,
-    "RELEASE_PWR": -0.3,
-    "RETRACT_PWR": 0.30,
-    "PWR_LIMIT": 0.30,
+    "HALL_TARGET": 2500,
+    "RETRACT_PWR": 0.40,
+    "RELEASE_PWR": -0.30,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
-    "SAFETY_TIMEOUT": 0.7,
+    "SAFETY_TIMEOUT": 5,
     "RETRACT_SETTLE": 50,
     "RETRACT_TH": 8000,
     "PWD_ADP_TH": 10000,
@@ -131,7 +134,9 @@ mv_state = {
     "ground_ready": True,
     "td_fired": False,
     "landing_fired": False,
-    "auto_mode": True,
+    # None until the first flight-controller HEARTBEAT is processed.
+    "auto_mode": None,
+    "mode_name": None,
 }
 
 # Winch status
@@ -145,34 +150,43 @@ fsm_st = {
     "cycle_activated": False,
     "cycle_deactivated": False,
     "deploy_needed": False,
+    "deploy_allowed": True,
     "send_to_gcs": False,
+    "deploy_in_progress": False,
+    # Keep independent last-PWM values for manual RC input and mission servo output.
+    # This prevents low RC input messages from canceling a high SERVO_OUTPUT_RAW command.
     "_last_pwm": None,
+    "_last_pwm_rc": None,
+    "_last_pwm_servo": None,
     "_last_rel_t": 0.0,
     "_last_ret_t": 0.0,
 }
 
 # Trigger detection
-TRIGGER_CH = 8
+# RC input channel to monitor from MAVLink RC_CHANNELS.
+# This is 1-based: 8 means RC8 / chan8_raw.
+TRIGGER_RC_CH = 8
 PWM_RELEASE = 1800
 PWM_RETRACT = 1200
 DEBOUNCE_S = 0.1
 
+def trigger_pwm_value(msg, ch):
+    # Return PWM in microseconds for 1-based trigger channel ch.
+    # RC_CHANNELS is manual RC input: chan1_raw ... chan18_raw.
+    # SERVO_OUTPUT_RAW is autopilot output from mission DO_SET_SERVO: servo1_raw ... servo16_raw.
+    msg_type = msg.get_type()
 
-def servo_out_value(msg, ch):
-    # Return PWM in microseconds for 1-based output channel ch from SERVO_OUTPUT_RAW
-    if ch <= 8:
-        port = 0
-    elif ch <= 16:
-        port = 1
-    else:
-        port = 2
+    if msg_type == "RC_CHANNELS":
+        if ch < 1 or ch > 18:
+            return None
+        return getattr(msg, "chan%d_raw" % ch, None)
 
-    if getattr(msg, "port", 0) != port:
-        return None
+    if msg_type == "SERVO_OUTPUT_RAW":
+        if ch < 1 or ch > 16:
+            return None
+        return getattr(msg, "servo%d_raw" % ch, None)
 
-    idx = ((ch - 1) % 8) + 1
-    return getattr(msg, "servo%d_raw" % idx, None)
-
+    return None
 
 def fsm_consume_flags(fsm):
     keys = ("deploy_needed", "send_to_gcs", "cycle_activated", "cycle_deactivated")
@@ -181,46 +195,64 @@ def fsm_consume_flags(fsm):
         fsm[k] = False
     return out
 
-
-def handle_servo_output_raw(
+def handle_trigger_pwm(
     msg,
     fsm,
-    ch=TRIGGER_CH,
-    pwm_release=PWM_RELEASE,
-    pwm_retract=PWM_RETRACT,
+    ch=TRIGGER_RC_CH,
+    thresh_high=PWM_RELEASE,
+    thresh_low=PWM_RETRACT,
     debounce_s=DEBOUNCE_S,
 ):
-    pwm = servo_out_value(msg, ch)
+    msg_type = msg.get_type()
+    pwm = trigger_pwm_value(msg, ch)
+
     if pwm is None:
+        print("Trigger channel %d is not present in %s" % (ch, msg_type))
         return
 
+    if pwm == 0 or pwm == 65535:
+        return
+
+    if pwm > thresh_high:
+        state = "HIGH"
+    elif pwm < thresh_low:
+        state = "LOW"
+    else:
+        state = "MID"
+
+    if msg_type == "SERVO_OUTPUT_RAW":
+        last_key = "_last_pwm_servo"
+        src = "SERVO"
+    else:
+        last_key = "_last_pwm_rc"
+        src = "RC"
+
     now_m = time.monotonic()
-    last_pwm = fsm["_last_pwm"]
+    last_pwm = fsm.get(last_key)
 
     if last_pwm is not None:
-        if last_pwm != pwm:
-            print(
-                "pwm changed: last_pwm:%s, pwm:%s pwm_retract:%s, pwm_release:%s"
-                % (last_pwm, pwm, pwm_retract, pwm_release)
-            )
-
-        if last_pwm < pwm_release <= pwm and (now_m - fsm["_last_rel_t"]) > debounce_s:
+        if last_pwm < thresh_high <= pwm and (now_m - fsm["_last_rel_t"]) > debounce_s:
             fsm["_last_rel_t"] = now_m
             if not fsm["cycle_active"]:
                 fsm["cycle_active"] = True
                 fsm["cycle_activated"] = True
             fsm["deploy_needed"] = True
-            print("rising edge detected")
+            print("%s%d rising edge detected: %s -> %s (%s)" % (src, ch, last_pwm, pwm, state))
 
-        if last_pwm > pwm_retract >= pwm:
+        if last_pwm > thresh_low >= pwm and (now_m - fsm["_last_ret_t"]) > debounce_s:
             fsm["_last_ret_t"] = now_m
             if fsm["cycle_active"]:
                 fsm["cycle_active"] = False
                 fsm["cycle_deactivated"] = True
             fsm["send_to_gcs"] = True
-            print("falling edge detected")
+            print("%s%d falling edge detected: %s -> %s (%s)" % (src, ch, last_pwm, pwm, state))
 
+    fsm[last_key] = pwm
     fsm["_last_pwm"] = pwm
+
+# Backward-compatible name used by older code.
+def handle_rc_channels(msg, fsm, ch=TRIGGER_RC_CH, thresh_high=PWM_RELEASE, thresh_low=PWM_RETRACT, debounce_s=DEBOUNCE_S):
+    handle_trigger_pwm(msg, fsm, ch, thresh_high, thresh_low, debounce_s)
 
 def process_heartbeat(msg, st):
     base_mode = getattr(msg, "base_mode", 0)
@@ -240,13 +272,11 @@ def process_heartbeat(msg, st):
         st["ground_ready"] = True
 
     st["armed"] = armed
-    st["auto_mode"] = True
 
-    if custom_mode_name in ["RTL", "ACRO", "ALT_HOLD", "STABILIZE", "LOITER", "MANUAL", "Unknown"]:
-        st["auto_mode"] = False
-    else:
-        st["auto_mode"] = True
-
+    # CHANGED: Use mission SERVO_OUTPUT_RAW only in actual AUTO mode.
+    # Every other flight mode uses manual RC_CHANNELS input.
+    st["mode_name"] = custom_mode_name
+    st["auto_mode"] = (custom_mode_name == "AUTO")
 
 def process_statustext(txt, st):
     if not txt:
@@ -255,63 +285,66 @@ def process_statustext(txt, st):
     if "mission" in s and "complete" in s:
         st["awaiting_final_td"] = True
 
-
 def hall_raw(c):
     if adc_sim_flag == 1:
         return int(c.read())
     else:
         return int(c.value)
 
-
 def release_win(servo, adc, cfg, st, stop_evt):
-    servo.value = -cfg["ROTATION_DIRECTION"] * abs(cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
+    svalue= cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
-    print("Release, winch servo open: %s" % servo.value)
+    print("Release, winch servo open: %s" % svalue)
+    servo.value = float(svalue)
+    time.sleep(0.25)
 
     while not stop_evt.is_set():
         if (time.time() - t0) > cfg["SAFETY_TIMEOUT"]:
             neutral(servo, cfg)
             print("safety timeout triggered during release")
             break
-
         try:
             dist = hall_raw(adc) - cfg["HALL_TARGET"]
         except Exception:
             neutral(servo, cfg)
             time.sleep(0.25)
             break
-
+        print("currnt dist: %s" % dist)
         if dist > cfg["RETRACT_TH"]:
             st["RETRACTED"] = 0
             break
-
-        time.sleep(0.25)
-
     neutral(servo, cfg)
-
 
 def retract_adaptive(servo, adc, cfg, st):
     try:
         dist = hall_raw(adc) - cfg["HALL_TARGET"]
+
     except Exception:
         neutral(servo, cfg)
         time.sleep(0.25)
         return False
 
     pwr = dist / float(cfg["HALL_MAX"] - cfg["HALL_MIN"])
-    pwr = pwr * cfg["PWR_LIMIT"]
+    pwr = pwr * cfg["RETRACT_PWR"]
+    print("currnt adaptive dist: %s" % dist)
+    #print("currnt adaptive raw val: %s" % hall_raw(adc))
+    print("pwr0: %s" % pwr)
 
     if pwr > 0.0:
         pwr = math.pow(pwr, 1.0 / 3.0)
+        print("pwr1: %s" % pwr)
 
-    if pwr > cfg["PWR_LIMIT"]:
-        pwr = cfg["PWR_LIMIT"]
+    if pwr > cfg["RETRACT_PWR"]:
+        pwr = cfg["RETRACT_PWR"]
+
     else:
         pwr = 0
 
     if dist < (cfg["HALL_TARGET"] + cfg["RETRACT_SETTLE"]):
         if st["RETRACTED"] != 1:
             st["RETRACTED"] = 1
+            fsm_st["deploy_allowed"] = True
+            print("Deploy re-enabled (fully retracted)")
             if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
                 neutral(servo, cfg)
             return True
@@ -319,8 +352,9 @@ def retract_adaptive(servo, adc, cfg, st):
         if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
             neutral(servo, cfg)
 
-    elif (dist < 10000) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0):
+    elif (dist < cfg["PWD_ADP_TH"]) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0):
         servo.value = cfg["ROTATION_DIRECTION"] * pwr + cfg["NEUTRAL_POS"]
+        print("currnt adaptive pwr: %s" % servo.value)
 
     elif dist > cfg["RETRACT_TH"]:
         if st["RETRACTED"] != 0:
@@ -328,30 +362,27 @@ def retract_adaptive(servo, adc, cfg, st):
 
     return False
 
-
 def neutral(servo, cfg):
     servo.value = cfg["NEUTRAL_POS"]
-
+    print('inside neutral')
 
 def broadcast_value(x, n):
     return [] if n <= 0 else [x] * n
 
-
-# simulator flags
-data_sim_flag = False
-adc_sim_flag = 0
-
-
 def winch_thread(stop_evt, q_winch, cfg, st):
     try:
-        servo = Servo(
-            cfg["SERVO_PIN"],
-            min_pulse_width=0.0009,
-            max_pulse_width=0.0021,
-            frame_width=0.02,
-            pin_factory=PiGPIOFactory(),
-            initial_value=cfg["NEUTRAL_POS"],
-        )
+        # setup servo
+        if adc_sim_flag == 1: 
+            servo = ServoSim()  # to use servo simulator
+        else:
+            servo = Servo(
+                cfg["SERVO_PIN"],
+                min_pulse_width=0.0009,
+                max_pulse_width=0.0021,
+                frame_width=0.02,
+                pin_factory=PiGPIOFactory(),
+                initial_value=cfg["NEUTRAL_POS"],
+            )
     except Exception as e:
         print("Servo init failed: %s" % e)
         return
@@ -372,13 +403,12 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         else:
             i2c = busio.I2C(board.SCL, board.SDA)
             ads = ADS.ADS1115(i2c)
-            adc = AnalogIn(ads, ADS.P0)
+            adc = AnalogIn(ads, 0)
     except Exception as e:
         print("ADS1115 init failed: %s" % e)
         return
 
     print("winch ready")
-
     try:
         while not stop_evt.is_set():
             try:
@@ -388,22 +418,26 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
             if cmd:
                 act = (cmd.get("action") or "").upper()
-
                 if act == "RELEASE":
                     release_win(servo, adc, cfg, st, stop_evt)
 
-                elif act == "RETRACT":
+                elif act == "RETRACT":                    
                     dur = float(cmd.get("duration", 0.0))
                     print("RETRACT for %ss" % dur)
                     t0 = time.time()
                     servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"]
+                    print("servo.value %s" % servo.value)
+                    time.sleep(0.25)
 
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
+                            print("Fully retractd!")
                             break
                         time.sleep(0.05)
-
+                    if (time.time() - t0) >= dur:
+                        print("WARNING: Retract timeout, not fully retracted, future release prevented for now")
+                    retract_flag = True
                     neutral(servo, cfg)
 
                 elif act == "NEUTRAL":
@@ -419,14 +453,14 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         neutral(servo, cfg)
         time.sleep(0.1)
 
-
 def ble_thread(stop_evt, q_ble, q_mav, st):
     ble = st["ble"] = BluetoothReader(st["ble_mutex"])
 
     try:
         st["c_status"] = "disconnected"
 
-        while ble is None or not ble.check_connection_status():
+        while not stop_evt.is_set() and (ble is None or not ble.check_connection_status()):
+        #while ble is None or not ble.check_connection_status():
             if ble.connect():
                 ble.set_lights("navigation")
                 logger.debug("connected to sensor, activated lights")
@@ -470,7 +504,6 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
 
             if cmd:
                 action = (cmd.get("action") or "").upper()
-
                 if action == "START":
                     print("BLE action:START")
                     if ble.sdata.get("connection"):
@@ -504,7 +537,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 % (ok, s_size)
                             )
 
-                            if ok:
+                            if ok and len(do_list) > 0:
+                            #if ok:
                                 do_list = ble.sdata.get("do_vals") or []
                                 temp_list = ble.sdata.get("temp_vals") or []
                                 press_list = ble.sdata.get("pressure_vals") or []
@@ -526,6 +560,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 q_mav.put({"action": "sendpayload"})
                             else:
                                 st["c_status"] = "fetch_empty"
+                                print("BLE fetch returned no samples; upload skipped")
 
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
@@ -573,10 +608,6 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
     try:
         m_fc = mavutil.mavlink_connection(FC_CONN_STR, baud=FC_BAUD)
 
-        m_gcs = None
-        if GCS_UDP_OUT:
-            m_gcs = mavutil.mavlink_connection(GCS_UDP_OUT)
-
         print("MAVLINK: waiting for HEARTBEAT from Cube...")
         hb = m_fc.wait_heartbeat(timeout=10)
 
@@ -587,8 +618,17 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 "MAVLINK: connected: sys=%s comp=%s"
                 % (hb.get_srcSystem(), hb.get_srcComponent())
             )
+            process_heartbeat(hb, mv_state)
+            print(
+                "MAVLINK: initial flight mode=%s, trigger source=%s"
+                % (
+                    mv_state.get("mode_name"),
+                    "SERVO_OUTPUT_RAW" if mv_state.get("auto_mode") else "RC_CHANNELS",
+                )
+            )
 
-        payload_link = m_gcs if m_gcs is not None else m_fc
+        # CHANGED: UART-only. Send payloads back through the flight-controller link.
+        payload_link = m_fc
 
         sensor_state["failed"] = resend_buffer(payload_link, sensor_state.get("failed", {}))
 
@@ -597,49 +637,88 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
         last_ping = time.time()
 
         while not stop_evt.is_set():
-            msg = m_fc.recv_match(blocking=True, timeout=0.5)
-            now = time.time()
 
-            if (now - last_ping) >= PING_SEC:
-                last_ping = now
+            # CHANGED: HEARTBEAT selects exactly one trigger source.
+            # AUTO mode: process only SERVO_OUTPUT_RAW from mission DO_SET_SERVO.
+            # Non-AUTO modes: process only RC_CHANNELS from the manual radio.
+            msg = m_fc.recv_match(
+                type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW"],
+                blocking=True,
+                timeout=2,
+            )
 
-            if not msg:
-                continue
+            flags = {
+                "deploy_needed": False,
+                "send_to_gcs": False,
+                "cycle_activated": False,
+                "cycle_deactivated": False,
+            }
 
-            t = msg.get_type()
+            if msg is None:
+                print("No HEARTBEAT, RC_CHANNELS, or SERVO_OUTPUT_RAW message received...")
+            else:
+                msg_type = msg.get_type()
 
-            if t == "GLOBAL_POSITION_INT":
-                last_lat = msg.lat / 1e7
-                last_lon = msg.lon / 1e7
+                if msg_type == "HEARTBEAT":
+                    # Ignore heartbeats from a GCS or another MAVLink component.
+                    is_fc_heartbeat = (
+                        msg.get_srcSystem() == m_fc.target_system
+                        and msg.get_srcComponent() == m_fc.target_component
+                    )
 
-            elif t == "HEARTBEAT":
-                process_heartbeat(msg, mv_state)
+                    if is_fc_heartbeat:
+                        previous_auto = mv_state.get("auto_mode")
+                        process_heartbeat(msg, mv_state)
+                        current_auto = mv_state.get("auto_mode")
 
-            elif t == "STATUSTEXT":
-                process_statustext(getattr(msg, "text", ""), mv_state)
+                        if previous_auto != current_auto:
+                            if current_auto:
+                                # Establish a fresh servo-output baseline after entering AUTO.
+                                fsm_st["_last_pwm_servo"] = None
+                                trigger_source = "SERVO_OUTPUT_RAW"
+                            else:
+                                # Establish a fresh manual-RC baseline after leaving AUTO.
+                                fsm_st["_last_pwm_rc"] = None
+                                trigger_source = "RC_CHANNELS"
 
-            elif t == "SERVO_OUTPUT_RAW":
-                handle_servo_output_raw(msg, fsm_st)
-                flags = fsm_consume_flags(fsm_st)
+                            print(
+                                "MAVLINK: flight mode=%s, trigger source=%s"
+                                % (mv_state.get("mode_name"), trigger_source)
+                            )
+
+                elif msg_type == "SERVO_OUTPUT_RAW":
+                    if mv_state.get("auto_mode") is True:
+                        handle_trigger_pwm(msg, fsm_st)
+                        flags = fsm_consume_flags(fsm_st)
+
+                elif msg_type == "RC_CHANNELS":
+                    if mv_state.get("auto_mode") is False:
+                        handle_trigger_pwm(msg, fsm_st)
+                        flags = fsm_consume_flags(fsm_st)
 
                 if flags["cycle_activated"]:
                     pass
 
                 if flags["deploy_needed"]:
-                    print("EVENT: start BLE sampling")
-                    q_ble.put({"action": "START"})
-                    q_winch.put({"action": "RELEASE"})
+                    if not fsm_st["deploy_allowed"] or winst["RETRACTED"] != 1:
+                        print("Deploy ignored: not allowed or not retracted")
+                    else:
+                        fsm_st["deploy_allowed"] = False   # lock it immediately
 
-                    freefall_sec = wincfg["FREEFALL_SEC"]
-                    retract_sec = wincfg["RETRACT_SEC"]
+                        print("EVENT: start BLE sampling")
+                        q_ble.put({"action": "START"})
+                        q_winch.put({"action": "RELEASE"})
 
-                    def enqueue_retract():
-                        q_winch.put({"action": "RETRACT", "duration": retract_sec})
+                        freefall_sec = wincfg["FREEFALL_SEC"]
+                        retract_sec = wincfg["RETRACT_SEC"]
 
-                    pending_retract_timer = threading.Timer(freefall_sec, enqueue_retract)
-                    pending_retract_timer.daemon = True
-                    pending_retract_timer.start()
+                        def enqueue_retract():
+                            q_winch.put({"action": "RETRACT", "duration": retract_sec})
 
+                        pending_retract_timer = threading.Timer(freefall_sec, enqueue_retract)
+                        pending_retract_timer.daemon = True
+                        pending_retract_timer.start()
+                 
                 if flags["send_to_gcs"]:
                     sensor_state["failed"] = resend_buffer(payload_link, sensor_state.get("failed", {}))
 
@@ -662,11 +741,32 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 
             action = (cmd.get("action") or "").upper()
             print("mav action:%s" % action)
-
+            '''
             if action == "SENDPAYLOAD":
                 cols = blest["last_cols"]
                 print("Uploading fetched BLE data: cols:%s" % cols)
                 send_payload(payload_link, cols, sensor_state)
+            '''
+            if action == "SENDPAYLOAD":
+                cols = blest.get("last_cols")
+
+                if not cols:
+                    print("SENDPAYLOAD skipped: no BLE data available")
+                    continue
+
+                n = len(cols.get("time", []))
+                if n <= 0:
+                    print("SENDPAYLOAD skipped: BLE data is empty")
+                    continue
+
+                try:
+                    print("Uploading fetched BLE data: cols:%s" % cols)
+                    send_payload(payload_link, cols, sensor_state)
+                except Exception as e:
+                    print("SENDPAYLOAD failed, MAV thread will continue: %s" % e)
+                    print(traceback.format_exc())
+                    continue
+
 
     except Exception as e:
         print("MAVLINK thread crashed: %s" % e)
@@ -696,7 +796,7 @@ def main():
         name="BLE",
         args=(stop_evt, q_ble, q_mav, ble_st),
     )
-
+    
     def cleanup(*_args):
         print("Stopping")
         stop_evt.set()
@@ -705,9 +805,13 @@ def main():
         t_win.join(timeout=0.5)
         t_ble.join(timeout=0.5)
         sys.exit(0)
-
+    
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
+
+    #t_mav.daemon = True
+    #t_win.daemon = True
+    #t_ble.daemon = True
 
     t_win.start()
     t_mav.start()
@@ -725,3 +829,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

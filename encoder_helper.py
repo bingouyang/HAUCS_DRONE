@@ -62,6 +62,46 @@ def chunker(values, n):
 # time_packet1, time_packet2... do_packet1, do_packet2,... 
 # temp_packetN... pressure_packtN
 
+def build_frames(values, var_id, start_seq, is_resend=False):
+    seq = start_seq
+
+    if not values:
+        return
+
+    for chunk in chunker(values, MAX_SAMPLES):
+        if not chunk:
+            continue
+
+        var_base = int(round(sum(chunk) / len(chunk)))
+        residues = []
+
+        for v in chunk:
+            r = int(round((v - var_base) * SCALE))
+            if r < -128:
+                r = -128
+            if r > 127:
+                r = 127
+            residues.append(r)
+
+        var_len = len(residues)
+        var_byte = (int(var_id) & 0x7F) | (0x80 if is_resend else 0)
+
+        header = struct.pack(
+            "!IBhB",
+            seq & 0xFFFFFFFF,
+            var_byte & 0xFF,
+            var_base,
+            var_len & 0xFF,
+        )
+
+        payload = bytearray(header + struct.pack("!" + "b" * var_len, *residues))
+
+        if len(payload) < DATA_BYTES:
+            payload.extend(b"\x00" * (DATA_BYTES - len(payload)))
+
+        yield seq, payload
+        seq = (seq + 1) & 0xFFFFFFFF
+'''
 def build_frames(values, var_id, start_seq):
     seq = start_seq
     if not values:  # control/marker frame
@@ -108,7 +148,7 @@ def build_frames(values, var_id, start_seq):
         
         #reset sequence id to 0 when reach max(uint16)
         seq = (seq + 1) & 0xFFFFFFFF
-
+'''
 def _assert_list_like(values, name):
     if not isinstance(values, list):
         raise TypeError(f"'{name}' must be a list, got {type(values).__name__}")

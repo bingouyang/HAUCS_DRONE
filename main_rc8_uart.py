@@ -77,12 +77,11 @@ TOUCH_CONFIRM_SEC = 2
 wParms = {
     "SERVO_PIN": 17,
     "ADC_PIN": 0,
-    "HALL_MIN": 1035,
+    "HALL_MIN": 2500,
     "HALL_MAX": 12285,
-    "HALL_TARGET": 1035,
+    "HALL_TARGET": 2600,
     "RETRACT_PWR": 0.30,
     "RELEASE_PWR": -0.40,
-    "PWR_LIMIT": 0.2,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
     "SAFETY_TIMEOUT": 5,
@@ -267,7 +266,8 @@ def release_win(servo, adc, cfg, st, stop_evt):
     t0 = time.time()
     print("Release, winch servo open: %s" % svalue)
     servo.value = float(svalue)
-    
+    time.sleep(0.5)
+
     while not stop_evt.is_set():
         if (time.time() - t0) > cfg["SAFETY_TIMEOUT"]:
             neutral(servo, cfg)
@@ -283,8 +283,6 @@ def release_win(servo, adc, cfg, st, stop_evt):
         if dist > cfg["RETRACT_TH"]:
             st["RETRACTED"] = 0
             break
-
-        time.sleep(0.25)
     neutral(servo, cfg)
 
 def retract_adaptive(servo, adc, cfg, st):
@@ -297,15 +295,18 @@ def retract_adaptive(servo, adc, cfg, st):
         return False
 
     pwr = dist / float(cfg["HALL_MAX"] - cfg["HALL_MIN"])
-    pwr = pwr * cfg["PWR_LIMIT"]
+    pwr = pwr * cfg["RETRACT_PWR"]
     print("currnt adaptive dist: %s" % dist)
-    #print("currnt adaptive pwr: %s" % pwr)
+    #print("currnt adaptive raw val: %s" % hall_raw(adc))
+    print("pwr0: %s" % pwr)
 
     if pwr > 0.0:
         pwr = math.pow(pwr, 1.0 / 3.0)
+        print("pwr1: %s" % pwr)
 
-    if pwr > cfg["PWR_LIMIT"]:
-        pwr = cfg["PWR_LIMIT"]
+    if pwr > cfg["RETRACT_PWR"]:
+        pwr = cfg["RETRACT_PWR"]
+
     else:
         pwr = 0
 
@@ -321,8 +322,9 @@ def retract_adaptive(servo, adc, cfg, st):
         if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
             neutral(servo, cfg)
 
-    elif (dist < 10000) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0):
+    elif (dist < cfg["PWD_ADP_TH"]) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0):
         servo.value = cfg["ROTATION_DIRECTION"] * pwr + cfg["NEUTRAL_POS"]
+        print("currnt adaptive pwr: %s" % servo.value)
 
     elif dist > cfg["RETRACT_TH"]:
         if st["RETRACTED"] != 0:
@@ -372,6 +374,12 @@ def winch_thread(stop_evt, q_winch, cfg, st):
             i2c = busio.I2C(board.SCL, board.SDA)
             ads = ADS.ADS1115(i2c)
             adc = AnalogIn(ads, 0)
+            
+            ############################ TEST
+            #while True:
+            #    print(adc.value)
+            #    time.sleep(2)
+            ###################################
     except Exception as e:
         print("ADS1115 init failed: %s" % e)
         return
@@ -395,7 +403,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     t0 = time.time()
                     servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"]
                     print("servo.value %s" % servo.value)
-                    time.sleep(0.5)
+                    time.sleep(0.25)
 
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
@@ -405,7 +413,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                         time.sleep(0.05)
                     if (time.time() - t0) >= dur:
                         print("WARNING: Retract timeout, not fully retracted, future release prevented for now")
-                    
+                    retract_flag = True
                     neutral(servo, cfg)
 
                 elif act == "NEUTRAL":
@@ -427,7 +435,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
     try:
         st["c_status"] = "disconnected"
 
-        while ble is None or not ble.check_connection_status():
+        while not stop_evt.is_set() and (ble is None or not ble.check_connection_status()):
+        #while ble is None or not ble.check_connection_status():
             if ble.connect():
                 ble.set_lights("navigation")
                 logger.debug("connected to sensor, activated lights")
@@ -471,7 +480,6 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
 
             if cmd:
                 action = (cmd.get("action") or "").upper()
-
                 if action == "START":
                     print("BLE action:START")
                     if ble.sdata.get("connection"):
@@ -505,7 +513,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 % (ok, s_size)
                             )
 
-                            if ok:
+                            if ok and len(do_list) > 0:
+                            #if ok:
                                 do_list = ble.sdata.get("do_vals") or []
                                 temp_list = ble.sdata.get("temp_vals") or []
                                 press_list = ble.sdata.get("pressure_vals") or []
@@ -527,6 +536,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 q_mav.put({"action": "sendpayload"})
                             else:
                                 st["c_status"] = "fetch_empty"
+                                print("BLE fetch returned no samples; upload skipped")
 
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
@@ -649,11 +659,32 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 
             action = (cmd.get("action") or "").upper()
             print("mav action:%s" % action)
-
+            '''
             if action == "SENDPAYLOAD":
                 cols = blest["last_cols"]
                 print("Uploading fetched BLE data: cols:%s" % cols)
                 send_payload(payload_link, cols, sensor_state)
+            '''
+            if action == "SENDPAYLOAD":
+                cols = blest.get("last_cols")
+
+                if not cols:
+                    print("SENDPAYLOAD skipped: no BLE data available")
+                    continue
+
+                n = len(cols.get("time", []))
+                if n <= 0:
+                    print("SENDPAYLOAD skipped: BLE data is empty")
+                    continue
+
+                try:
+                    print("Uploading fetched BLE data: cols:%s" % cols)
+                    send_payload(payload_link, cols, sensor_state)
+                except Exception as e:
+                    print("SENDPAYLOAD failed, MAV thread will continue: %s" % e)
+                    print(traceback.format_exc())
+                    continue
+
 
     except Exception as e:
         print("MAVLINK thread crashed: %s" % e)
@@ -683,7 +714,7 @@ def main():
         name="BLE",
         args=(stop_evt, q_ble, q_mav, ble_st),
     )
-
+    
     def cleanup(*_args):
         print("Stopping")
         stop_evt.set()
@@ -692,9 +723,13 @@ def main():
         t_win.join(timeout=0.5)
         t_ble.join(timeout=0.5)
         sys.exit(0)
-
+    
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
+
+    #t_mav.daemon = True
+    #t_win.daemon = True
+    #t_ble.daemon = True
 
     t_win.start()
     t_mav.start()
