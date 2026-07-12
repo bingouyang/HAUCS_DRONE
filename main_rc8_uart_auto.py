@@ -73,10 +73,8 @@ NAV_SAFETY_ARMED = mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
 PING_SEC = 2
 TOUCH_CONFIRM_SEC = 2
 
-# Winch constants
-# SERVO_PI: 17, temp change 18 for testing
 wParms = {
-    "SERVO_PIN": 18,
+    "SERVO_PIN": 17,
     "ADC_PIN": 0,
     "HALL_MIN": 2500,
     "HALL_MAX": 12285,
