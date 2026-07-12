@@ -542,10 +542,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 "finish sampling - queue mav cmd to upload data, ok: %s, sample_size:%s"
                                 % (ok, s_size)
                             )
-
+                            do_list = ble.sdata.get("do_vals") or []
                             if ok and len(do_list) > 0:
-                            #if ok:
-                                do_list = ble.sdata.get("do_vals") or []
                                 temp_list = ble.sdata.get("temp_vals") or []
                                 press_list = ble.sdata.get("pressure_vals") or []
                                 n = len(do_list)
@@ -574,6 +572,16 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
                             print("fetch failed: %s" % e)
+                        finally:
+                            # Always restore sampling type to auto, even if fetch/parse above failed,
+                            # so the sensor never gets stuck in "manual" mode.
+                            try:
+                                print("reset sample_type:%s" % BLE_INIT_SAMPLE_TYPE)
+                                ble.set_smpl_type(BLE_INIT_SAMPLE_TYPE)
+                                time.sleep(0.1)
+                            except Exception as e:
+                                print("failed to reset sample_type back to %s: %s" % (BLE_INIT_SAMPLE_TYPE, e))
+
                     else:
                         st["c_status"] = "fetch_skipped_disconnected"
 
