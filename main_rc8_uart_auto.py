@@ -8,6 +8,9 @@ import traceback
 from builtins import range
 import math
 import signal
+import os
+import csv
+from datetime import datetime
 from threading import Lock as QMutex
 
 import board
@@ -110,6 +113,9 @@ ble_st = {
 # Buffer json
 BUFFER_PATH = "outbox.json"
 csv_path = "input.csv"
+
+# Directory where each sampling operation's data is cached as its own CSV file.
+CACHE_DIR = "cache"
 
 # sensor data upload status and sequence id
 sensor_upload_failed = {}
@@ -327,7 +333,7 @@ def retract_adaptive(servo, adc, cfg, st):
     pwr = dist / float(cfg["HALL_MAX"] - cfg["HALL_MIN"])
     pwr = pwr * cfg["RETRACT_PWR"]
     print("currnt adaptive dist: %s" % dist)
-    #print("currnt adaptive raw val: %s" % hall_raw(adc))
+    print("currnt hall_raw val: %s" % hall_raw(adc))
     print("pwr0: %s" % pwr)
 
     if pwr > 0.0:
@@ -434,7 +440,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                         if retract_flag is True:
                             print("Fully retractd!")
                             break
-                        time.sleep(0.05)
+                        time.sleep(0.1)
                     if (time.time() - t0) >= dur:
                         print("WARNING: Retract timeout, not fully retracted, future release prevented for now")
                     retract_flag = True
@@ -453,6 +459,26 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         neutral(servo, cfg)
         time.sleep(0.1)
 
+def cache_sample_csv(cols, cache_dir=CACHE_DIR):
+    """Write one sampling operation's data to its own timestamped CSV file."""
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        fname = os.path.join(cache_dir, "sample_%s.csv" % ts)
+        fields = ["time", "do", "temp", "press", "init_DO", "init_pressure", "batt_v"]
+        rows = zip(*[cols.get(f, []) for f in fields])
+
+        with open(fname, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(fields)
+            writer.writerows(rows)
+
+        print("cached sampling data to %s" % fname)
+        return fname
+    except Exception as e:
+        print("failed to cache sampling data: %s" % e)
+        return None
+
 def ble_thread(stop_evt, q_ble, q_mav, st):
     ble = st["ble"] = BluetoothReader(st["ble_mutex"])
 
@@ -460,7 +486,6 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
         st["c_status"] = "disconnected"
 
         while not stop_evt.is_set() and (ble is None or not ble.check_connection_status()):
-        #while ble is None or not ble.check_connection_status():
             if ble.connect():
                 ble.set_lights("navigation")
                 logger.debug("connected to sensor, activated lights")
@@ -557,6 +582,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                     "init_pressure": broadcast_value(ble.sdata.get("init_pressure"), n),
                                     "batt_v": broadcast_value(ble.sdata.get("battv"), n),
                                 }
+                                cache_sample_csv(st["last_cols"])
                                 st["gcs_ready"] = True
                                 st["c_status"] = "fetched"
                                 q_mav.put({"action": "sendpayload"})
