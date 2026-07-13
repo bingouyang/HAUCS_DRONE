@@ -29,7 +29,7 @@ from adc_sim import ServoSim, LinkedHallADC
 
 # simulator flags
 data_sim_flag = False
-adc_sim_flag = 0
+adc_sim_flag = 1
 
 COPTER_MODES = {
     0: "STABILIZE",
@@ -222,7 +222,7 @@ def handle_trigger_pwm(
     pwm = trigger_pwm_value(msg, ch)
 
     if pwm is None:
-        print("Trigger channel %d is not present in %s" % (ch, msg_type))
+        logger.info("Trigger channel %d is not present in %s" % (ch, msg_type))
         return
 
     if pwm == 0 or pwm == 65535:
@@ -249,7 +249,7 @@ def handle_trigger_pwm(
         dbg_key = "_dbg_last_call_" + src
         prev_call = fsm.get(dbg_key)
         gap = (now_m - prev_call) if prev_call is not None else 0.0
-        print(
+        logger.info(
             "[TRIG-DEBUG] src=%s ch=%d pwm=%s wall=%.3f gap_since_last_%s_msg=%.3fs"
             % (src, ch, pwm, time.time(), src, gap)
         )
@@ -262,7 +262,7 @@ def handle_trigger_pwm(
                 fsm["cycle_active"] = True
                 fsm["cycle_activated"] = True
             fsm["deploy_needed"] = True
-            print("%s%d rising edge detected: %s -> %s (%s)" % (src, ch, last_pwm, pwm, state))
+            logger.info("%s%d rising edge detected: %s -> %s (%s)" % (src, ch, last_pwm, pwm, state))
 
         if last_pwm > thresh_low >= pwm and (now_m - fsm["_last_ret_t"]) > debounce_s:
             fsm["_last_ret_t"] = now_m
@@ -270,7 +270,7 @@ def handle_trigger_pwm(
                 fsm["cycle_active"] = False
                 fsm["cycle_deactivated"] = True
             fsm["send_to_gcs"] = True
-            print("%s%d falling edge detected: %s -> %s (%s)" % (src, ch, last_pwm, pwm, state))
+            logger.info("%s%d falling edge detected: %s -> %s (%s)" % (src, ch, last_pwm, pwm, state))
 
     fsm[last_key] = pwm
     fsm["_last_pwm"] = pwm
@@ -319,14 +319,14 @@ def hall_raw(c):
 def release_win(servo, adc, cfg, st, stop_evt):
     svalue= cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
-    print("Release, winch servo open: %s" % svalue)
+    logger.info("Release, winch servo open: %s" % svalue)
     servo.value = float(svalue)
     time.sleep(0.25)
 
     while not stop_evt.is_set():
         if (time.time() - t0) > cfg["SAFETY_TIMEOUT"]:
             neutral(servo, cfg)
-            print("safety timeout triggered during release")
+            logger.info("safety timeout triggered during release")
             break
         try:
             dist = hall_raw(adc) - cfg["HALL_TARGET"]
@@ -334,7 +334,7 @@ def release_win(servo, adc, cfg, st, stop_evt):
             neutral(servo, cfg)
             time.sleep(0.25)
             break
-        print("currnt dist: %s" % dist)
+        logger.info("currnt dist: %s" % dist)
         if dist > cfg["RETRACT_TH"]:
             st["RETRACTED"] = 0
             break
@@ -351,13 +351,13 @@ def retract_adaptive(servo, adc, cfg, st):
 
     pwr = dist / float(cfg["HALL_MAX"] - cfg["HALL_MIN"])
     pwr = pwr * cfg["RETRACT_PWR"]
-    print("currnt adaptive dist: %s" % dist)
-    print("currnt hall_raw val: %s" % hall_raw(adc))
-    print("pwr0: %s" % pwr)
+    logger.info("currnt adaptive dist: %s" % dist)
+    logger.info("currnt hall_raw val: %s" % hall_raw(adc))
+    logger.info("pwr0: %s" % pwr)
 
     if pwr > 0.0:
         pwr = math.pow(pwr, 1.0 / 3.0)
-        print("pwr1: %s" % pwr)
+        logger.info("pwr1: %s" % pwr)
 
     if pwr > cfg["RETRACT_PWR"]:
         pwr = cfg["RETRACT_PWR"]
@@ -369,7 +369,7 @@ def retract_adaptive(servo, adc, cfg, st):
         if st["RETRACTED"] != 1:
             st["RETRACTED"] = 1
             fsm_st["deploy_allowed"] = True
-            print("Deploy re-enabled (fully retracted)")
+            logger.info("Deploy re-enabled (fully retracted)")
             if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
                 neutral(servo, cfg)
             return True
@@ -379,7 +379,7 @@ def retract_adaptive(servo, adc, cfg, st):
 
     elif (dist < cfg["PWD_ADP_TH"]) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0):
         servo.value = cfg["ROTATION_DIRECTION"] * pwr + cfg["NEUTRAL_POS"]
-        print("currnt adaptive pwr: %s" % servo.value)
+        logger.info("currnt adaptive pwr: %s" % servo.value)
 
     elif dist > cfg["RETRACT_TH"]:
         if st["RETRACTED"] != 0:
@@ -389,7 +389,7 @@ def retract_adaptive(servo, adc, cfg, st):
 
 def neutral(servo, cfg):
     servo.value = cfg["NEUTRAL_POS"]
-    print('inside neutral')
+    logger.info('inside neutral')
 
 def broadcast_value(x, n):
     return [] if n <= 0 else [x] * n
@@ -409,7 +409,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 initial_value=cfg["NEUTRAL_POS"],
             )
     except Exception as e:
-        print("Servo init failed: %s" % e)
+        logger.info("Servo init failed: %s" % e)
         return
 
     try:
@@ -430,10 +430,10 @@ def winch_thread(stop_evt, q_winch, cfg, st):
             ads = ADS.ADS1115(i2c)
             adc = AnalogIn(ads, 0)
     except Exception as e:
-        print("ADS1115 init failed: %s" % e)
+        logger.info("ADS1115 init failed: %s" % e)
         return
 
-    print("winch ready")
+    logger.info("winch ready")
     try:
         while not stop_evt.is_set():
             try:
@@ -448,20 +448,20 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
                 elif act == "RETRACT":
                     dur = float(cmd.get("duration", 0.0))
-                    print("RETRACT for %ss" % dur)
+                    logger.info("RETRACT for %ss" % dur)
                     t0 = time.time()
                     servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"]
-                    print("servo.value %s" % servo.value)
+                    logger.info("servo.value %s" % servo.value)
                     time.sleep(0.25)
 
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
-                            print("Fully retractd!")
+                            logger.info("Fully retractd!")
                             break
                         time.sleep(0.1)
                     if (time.time() - t0) >= dur:
-                        print("WARNING: Retract timeout, not fully retracted, future release prevented for now")
+                        logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
                     retract_flag = True
                     neutral(servo, cfg)
 
@@ -471,7 +471,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
             time.sleep(0.1)
 
     except Exception as e:
-        print("winch thread crashed:%s" % e)
+        logger.info("winch thread crashed:%s" % e)
         neutral(servo, cfg)
 
     finally:
@@ -497,10 +497,10 @@ def cache_sample_csv(cols, cache_dir=CACHE_DIR):
             writer.writerow(fields)
             writer.writerows(rows)
 
-        print("cached sampling data to %s" % fname)
+        logger.info("cached sampling data to %s" % fname)
         return fname
     except Exception as e:
-        print("failed to cache sampling data: %s" % e)
+        logger.info("failed to cache sampling data: %s" % e)
         return None
 
 def ble_thread(stop_evt, q_ble, q_mav, st):
@@ -546,7 +546,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
 
             try:
                 cmd = q_ble.get(timeout=0.25)
-                print("cmd:%s" % cmd)
+                logger.info("cmd:%s" % cmd)
             except queue.Empty:
                 cmd = None
 
@@ -558,18 +558,18 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                 # unreliable part. mav_thread just triggers the winch and records the deploy
                 # location locally (see deploy_lat / deploy_lon below).
                 if action == "FETCH":
-                    print("BLE action:FETCH: %s" % ble.sdata.get("connection"))
+                    logger.info("BLE action:FETCH: %s" % ble.sdata.get("connection"))
                     if ble.sdata.get("connection"):
                         try:
 
                             ble.set_sampl_flag(0)
                             time.sleep(0.1)
                             sflag = ble.get_sampl_flag()
-                            print("stop sampling sampling flag: %s" % sflag)
+                            logger.info("stop sampling sampling flag: %s" % sflag)
                             s_size = ble.get_sample_size()
                             ok = bool(ble.get_sample_data())
                             st["sampling"] = False
-                            print(
+                            logger.info(
                                 "finish sampling - queue mav cmd to upload data, ok: %s, sample_size:%s"
                                 % (ok, s_size)
                             )
@@ -578,7 +578,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 temp_list = ble.sdata.get("temp_vals") or []
                                 press_list = ble.sdata.get("pressure_vals") or []
                                 n = len(do_list)
-                                print("sampling finished, length:%s" % n)
+                                logger.info("sampling finished, length:%s" % n)
                                 ts_list = list(range(n))
 
                                 # lat/lon were locked in mav_thread at the moment the winch
@@ -614,10 +614,10 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 q_mav.put({"action": "sendpayload"})
                             else:
                                 st["c_status"] = "fetch_empty"
-                                print("BLE fetch returned no samples; upload skipped")
+                                logger.info("BLE fetch returned no samples; upload skipped")
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
-                            print("fetch failed: %s" % e)
+                            logger.info("fetch failed: %s" % e)
                         finally:
                             # Re-arm the buffer for the next arm. auto_sensing()
                             # on the sensor only re-fires when sample_count == 0, so this reset
@@ -626,9 +626,9 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             try:
                                 ble.set_sample_reset()
                                 time.sleep(0.1)
-                                print("re-armed for next sample")
+                                logger.info("re-armed for next sample")
                             except Exception as e:
-                                print("failed to re-arm sensor for next sample: %s" % e)
+                                logger.info("failed to re-arm sensor for next sample: %s" % e)
 
                     else:
                         st["c_status"] = "fetch_skipped_disconnected"
@@ -638,10 +638,10 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                     st["c_status"] = "disconnected_by_request"
 
     except Exception as e:
-        print("BLE thread crashed: %s" % e)
+        logger.info("BLE thread crashed: %s" % e)
 
     finally:
-        print("BLE thread close")
+        logger.info("BLE thread close")
         ble_close(ble)
 
 
@@ -668,23 +668,23 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
     if "failed" not in sensor_state:
         sensor_state["failed"] = load_buffer(BUFFER_PATH)
 
-    print("MAVLINK: starting on FC link %s @ %s" % (FC_CONN_STR, FC_BAUD))
+    logger.info("MAVLINK: starting on FC link %s @ %s" % (FC_CONN_STR, FC_BAUD))
 
     try:
         m_fc = mavutil.mavlink_connection(FC_CONN_STR, baud=FC_BAUD)
 
-        print("MAVLINK: waiting for HEARTBEAT from Cube...")
+        logger.info("MAVLINK: waiting for HEARTBEAT from Cube...")
         hb = m_fc.wait_heartbeat(timeout=10)
 
         if not hb:
-            print("MAVLINK: no HEARTBEAT in 10s (check UART wiring, baud, serial port)")
+            logger.info("MAVLINK: no HEARTBEAT in 10s (check UART wiring, baud, serial port)")
         else:
-            print(
+            logger.info(
                 "MAVLINK: connected: sys=%s comp=%s"
                 % (hb.get_srcSystem(), hb.get_srcComponent())
             )
             process_heartbeat(hb, mv_state)
-            print(
+            logger.info(
                 "MAVLINK: initial flight mode=%s, trigger source=%s"
                 % (
                     mv_state.get("mode_name"),
@@ -707,9 +707,9 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     200000,  # microseconds -> 5 Hz
                     0, 0, 0, 0, 0,
                 )
-                print("MAVLINK: requested GLOBAL_POSITION_INT at 5 Hz")
+                logger.info("MAVLINK: requested GLOBAL_POSITION_INT at 5 Hz")
             except Exception as e:
-                print("MAVLINK: failed to request GLOBAL_POSITION_INT: %s" % e)
+                logger.info("MAVLINK: failed to request GLOBAL_POSITION_INT: %s" % e)
 
         # CHANGED: UART-only. Send payloads back through the flight-controller link.
         payload_link = m_fc
@@ -731,7 +731,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     # this one. If this is large, something AFTER recv_match in the
                     # previous pass was slow (BLE queue puts, file I/O, prints, etc.) --
                     # i.e. the bottleneck is in this script, not the MAVLink link.
-                    print("[LOOP-DEBUG] %.3fs elapsed since previous loop iteration finished" % idle_gap)
+                    logger.info("[LOOP-DEBUG] %.3fs elapsed since previous loop iteration finished" % idle_gap)
                 dbg_prev_iter_start = iter_start
 
             # CHANGED: HEARTBEAT selects exactly one trigger source.
@@ -749,7 +749,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     # Time recv_match() itself took to return. If this is large, the
                     # bottleneck is upstream: the FC isn't sending matching messages
                     # promptly, or there's a backlog on the link.
-                    print(
+                    logger.info(
                         "[LOOP-DEBUG] recv_match blocked %.3fs, returned %s"
                         % (recv_dt, msg.get_type() if msg else None)
                     )
@@ -762,7 +762,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             }
 
             if msg is None:
-                print("No HEARTBEAT, RC_CHANNELS, or SERVO_OUTPUT_RAW message received...")
+                logger.info("No HEARTBEAT, RC_CHANNELS, or SERVO_OUTPUT_RAW message received...")
             else:
                 msg_type = msg.get_type()
 
@@ -788,7 +788,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                                 fsm_st["_last_pwm_rc"] = None
                                 trigger_source = "RC_CHANNELS"
 
-                            print(
+                            logger.info(
                                 "MAVLINK: flight mode=%s, trigger source=%s"
                                 % (mv_state.get("mode_name"), trigger_source)
                             )
@@ -808,7 +808,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     # moment of deploy below, not re-read later at fetch/upload time once
                     # the drone may have already lifted off and moved on.
                     if last_lat is None:
-                        print(
+                        logger.info(
                             "MAVLINK: first GLOBAL_POSITION_INT received, lat=%s lon=%s"
                             % (msg.lat / 1e7, msg.lon / 1e7)
                         )
@@ -820,7 +820,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 
                 if flags["deploy_needed"]:
                     if not fsm_st["deploy_allowed"] or winst["RETRACTED"] != 1:
-                        print("Deploy ignored: not allowed or not retracted")
+                        logger.info("Deploy ignored: not allowed or not retracted")
                     else:
                         fsm_st["deploy_allowed"] = False   # lock it immediately
 
@@ -830,7 +830,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         blest["deploy_lat"] = last_lat
                         blest["deploy_lon"] = last_lon
 
-                        print(
+                        logger.info(
                             "EVENT: winch release, sensor auto-starts sampling, lat=%s lon=%s"
                             % (last_lat, last_lon)
                         )
@@ -847,7 +847,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         pending_retract_timer.start()
 
                 if flags["send_to_gcs"]:
-                    print(
+                    logger.info(
                         "EVENT: requesting data to send to gcs, lat=%s lon=%s"
                         % (last_lat, last_lon)
                     )
@@ -857,11 +857,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         cols = prep_sim_data(csv_path)
                         send_payload(payload_link, cols, sensor_state)
                     else:
-                        print("MAV to BLE: fetch data from BLE sensor")
+                        logger.info("MAV to BLE: fetch data from BLE sensor")
                         q_ble.put({"action": "FETCH"})
 
                 if flags["cycle_deactivated"]:
-                    print("EVENT: cycle_deactivated")
+                    logger.info("EVENT: cycle_deactivated")
                     q_winch.put({"action": "NEUTRAL"})
 
             # Non-blocking: recv_match() above already provides the natural pacing (it
@@ -875,36 +875,36 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             # seeing it grows the longer it runs.
             try:
                 cmd = q_mav.get_nowait()
-                print("cmd:%s" % cmd)
+                logger.info("cmd:%s" % cmd)
             except queue.Empty:
                 continue
 
             action = (cmd.get("action") or "").upper()
-            print("mav action:%s" % action)
+            logger.info("mav action:%s" % action)
 
             if action == "SENDPAYLOAD":
                 cols = blest.get("last_cols")
 
                 if not cols:
-                    print("SENDPAYLOAD skipped: no BLE data available")
+                    logger.info("SENDPAYLOAD skipped: no BLE data available")
                     continue
 
                 n = len(cols.get("time", []))
                 if n <= 0:
-                    print("SENDPAYLOAD skipped: BLE data is empty")
+                    logger.info("SENDPAYLOAD skipped: BLE data is empty")
                     continue
 
                 try:
-                    print("Uploading fetched BLE data: cols:%s" % cols)
+                    logger.info("Uploading fetched BLE data: cols:%s" % cols)
                     send_payload(payload_link, cols, sensor_state)
                 except Exception as e:
-                    print("SENDPAYLOAD failed, MAV thread will continue: %s" % e)
-                    print(traceback.format_exc())
+                    logger.info("SENDPAYLOAD failed, MAV thread will continue: %s" % e)
+                    logger.info(traceback.format_exc())
                     continue
 
     except Exception as e:
-        print("MAVLINK thread crashed: %s" % e)
-        print(traceback.format_exc())
+        logger.info("MAVLINK thread crashed: %s" % e)
+        logger.info(traceback.format_exc())
 
 
 def main():
@@ -932,7 +932,7 @@ def main():
     )
 
     def cleanup(*_args):
-        print("Stopping")
+        logger.info("Stopping")
         stop_evt.set()
         q_ble.put({"action": "DISCONNECT"})
         t_mav.join(timeout=1)
@@ -955,7 +955,7 @@ def main():
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("Ctrl C stopping")
+        logger.info("Ctrl C stopping")
         stop_evt.set()
     finally:
         cleanup()
