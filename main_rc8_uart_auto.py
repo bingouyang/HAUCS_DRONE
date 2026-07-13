@@ -96,9 +96,11 @@ wParms = {
 }
 
 # BLE parms
+# The sensor boots in "auto" mode and this code never switches it -- it starts/stops
+# sampling itself off its own pressure sensor. A BLE "manual start" command isn't
+# reliable right at splashdown (the link can be marginal or momentarily lost at exactly
+# that instant), so there's no sample_type toggling here at all anymore.
 BLE_SAMPLE_SIZE = 120
-BLE_SAMPLE_TYPE = "manual"
-BLE_INIT_SAMPLE_TYPE = "auto"
 BLE_PMODE = "high"
 BLE_FETCH_TIMEOUT = 5
 
@@ -176,6 +178,13 @@ PWM_RELEASE = 1800
 PWM_RETRACT = 1200
 DEBOUNCE_S = 0.1
 
+# Set True to log every trigger-channel PWM update with a wall-clock timestamp and the
+# gap since the previous update of the same source (RC vs SERVO). Useful for tracking
+# down "switch flip to detection" lag: if the gap between consecutive prints is much
+# larger than the RC/telemetry link's actual update rate, the delay is upstream of this
+# code (link backlog or FC stream-rate config), not in this script's processing.
+DEBUG_TRIGGER_TIMING = False
+
 def trigger_pwm_value(msg, ch):
     # Return PWM in microseconds for 1-based trigger channel ch.
     # RC_CHANNELS is manual RC input: chan1_raw ... chan18_raw.
@@ -235,6 +244,16 @@ def handle_trigger_pwm(
 
     now_m = time.monotonic()
     last_pwm = fsm.get(last_key)
+
+    if DEBUG_TRIGGER_TIMING:
+        dbg_key = "_dbg_last_call_" + src
+        prev_call = fsm.get(dbg_key)
+        gap = (now_m - prev_call) if prev_call is not None else 0.0
+        print(
+            "[TRIG-DEBUG] src=%s ch=%d pwm=%s wall=%.3f gap_since_last_%s_msg=%.3fs"
+            % (src, ch, pwm, time.time(), src, gap)
+        )
+        fsm[dbg_key] = now_m
 
     if last_pwm is not None:
         if last_pwm < thresh_high <= pwm and (now_m - fsm["_last_rel_t"]) > debounce_s:
@@ -378,7 +397,7 @@ def broadcast_value(x, n):
 def winch_thread(stop_evt, q_winch, cfg, st):
     try:
         # setup servo
-        if adc_sim_flag == 1: 
+        if adc_sim_flag == 1:
             servo = ServoSim()  # to use servo simulator
         else:
             servo = Servo(
@@ -427,7 +446,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 if act == "RELEASE":
                     release_win(servo, adc, cfg, st, stop_evt)
 
-                elif act == "RETRACT":                    
+                elif act == "RETRACT":
                     dur = float(cmd.get("duration", 0.0))
                     print("RETRACT for %ss" % dur)
                     t0 = time.time()
@@ -465,7 +484,12 @@ def cache_sample_csv(cols, cache_dir=CACHE_DIR):
         os.makedirs(cache_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         fname = os.path.join(cache_dir, "sample_%s.csv" % ts)
-        fields = ["time", "do", "temp", "press", "init_DO", "init_pressure", "batt_v"]
+        # NOTE: "DO" and "pressure" (not "do"/"press") to match encoder_helper.py's
+        # VAR_MAP/SEND_ORDER exactly -- send_payload() silently drops any column whose
+        # key doesn't match one of those names, with no error. "lat"/"lon" are cached
+        # here for the local CSV but are NOT in VAR_MAP, so they still won't be sent to
+        # the base station (see note below where last_cols is built).
+        fields = ["time", "DO", "temp", "pressure", "init_DO", "init_pressure", "batt_v", "lat", "lon"]
         rows = zip(*[cols.get(f, []) for f in fields])
 
         with open(fname, "w", newline="") as f:
@@ -493,9 +517,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
             time.sleep(0.2)
             ble.set_calibration_pressure()
             time.sleep(0.2)
-            print("init sample_type:%s" % BLE_INIT_SAMPLE_TYPE)
-            ble.set_smpl_type(BLE_INIT_SAMPLE_TYPE)
-            time.sleep(0.1)
+            # No sample_type call needed here -- the sensor already boots in "auto" and
+            # nothing in this code ever switches it away from that anymore.
             st["c_status"] = "connected"
 
         last_poll = 0.0
@@ -529,27 +552,12 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
 
             if cmd:
                 action = (cmd.get("action") or "").upper()
-                if action == "START":
-                    print("BLE action:START")
-                    if ble.sdata.get("connection"):
-                        try:
-                            print("set sample_type:%s" % BLE_SAMPLE_TYPE)
-                            ble.set_smpl_type(BLE_SAMPLE_TYPE)
-                            time.sleep(0.1)
-                            ble.set_sample_reset()
-                            ble.set_sampl_flag(1)
-                            sflag = ble.get_sampl_flag()
-                            print("start sampling, sampling flag: %s" % sflag)
-                            s_type = ble.get_smpl_type()
-                            print("sample_type:%s" % s_type)
-                            st["sampling"] = True
-                            st["c_status"] = "sampling_started"
-                        except Exception:
-                            st["c_status"] = "start_failed"
-                    else:
-                        st["c_status"] = "start_skipped_disconnected"
-
-                elif action == "FETCH":
+                # Sensor stays in "auto" mode permanently now -- it starts/stops sampling
+                # itself from its own pressure sensor. There's no BLE START command anymore:
+                # requiring a live BLE round-trip at the exact splashdown instant was the
+                # unreliable part. mav_thread just triggers the winch and records the deploy
+                # location locally (see deploy_lat / deploy_lon below).
+                if action == "FETCH":
                     print("BLE action:FETCH: %s" % ble.sdata.get("connection"))
                     if ble.sdata.get("connection"):
                         try:
@@ -573,14 +581,32 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 print("sampling finished, length:%s" % n)
                                 ts_list = list(range(n))
 
+                                # lat/lon were locked in mav_thread at the moment the winch
+                                # released (deploy rising edge), not re-read here, so this is
+                                # where the sensor actually went, not where the drone drifted
+                                # to by the time fetch happens.
+                                # Keys here must match encoder_helper.VAR_MAP/SEND_ORDER
+                                # exactly ("DO"/"pressure", not "do"/"press") --
+                                # prepare_per_var_queues() does `if name not in data_cols:
+                                # continue`, so a mismatched key is dropped with no error
+                                # or warning at all. This was silently dropping DO and
+                                # pressure from every upload.
+                                # lat/lon are NOT in VAR_MAP, so they're included here for
+                                # the local CSV cache only -- they still won't reach the
+                                # base station until encoder_helper.py is extended to
+                                # carry them (see chat for why that needs more than just
+                                # adding the key -- the residue encoding as-is isn't
+                                # precise enough for GPS coordinates).
                                 st["last_cols"] = {
                                     "time": ts_list,
-                                    "do": do_list,
+                                    "DO": do_list,
                                     "temp": temp_list,
-                                    "press": press_list,
+                                    "pressure": press_list,
                                     "init_DO": broadcast_value(ble.sdata.get("init_do"), n),
                                     "init_pressure": broadcast_value(ble.sdata.get("init_pressure"), n),
                                     "batt_v": broadcast_value(ble.sdata.get("battv"), n),
+                                    "lat": broadcast_value(st.get("deploy_lat"), n),
+                                    "lon": broadcast_value(st.get("deploy_lon"), n),
                                 }
                                 cache_sample_csv(st["last_cols"])
                                 st["gcs_ready"] = True
@@ -589,22 +615,20 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             else:
                                 st["c_status"] = "fetch_empty"
                                 print("BLE fetch returned no samples; upload skipped")
-                                
-                            print("reset sample_type:%s" % BLE_INIT_SAMPLE_TYPE)
-                            ble.set_smpl_type(BLE_INIT_SAMPLE_TYPE)
-                            time.sleep(0.1)
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
                             print("fetch failed: %s" % e)
                         finally:
-                            # Always restore sampling type to auto, even if fetch/parse above failed,
-                            # so the sensor never gets stuck in "manual" mode.
+                            # Re-arm the buffer for the next arm. auto_sensing()
+                            # on the sensor only re-fires when sample_count == 0, so this reset
+                            # is what lets the next drop trigger itself again. No sample_type
+                            # call needed -- it's never switched away from "auto".
                             try:
-                                print("reset sample_type:%s" % BLE_INIT_SAMPLE_TYPE)
-                                ble.set_smpl_type(BLE_INIT_SAMPLE_TYPE)
+                                ble.set_sample_reset()
                                 time.sleep(0.1)
+                                print("re-armed for next sample")
                             except Exception as e:
-                                print("failed to reset sample_type back to %s: %s" % (BLE_INIT_SAMPLE_TYPE, e))
+                                print("failed to re-arm sensor for next sample: %s" % e)
 
                     else:
                         st["c_status"] = "fetch_skipped_disconnected"
@@ -668,6 +692,25 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 )
             )
 
+            # Explicitly request GLOBAL_POSITION_INT. Companion-computer links don't
+            # always stream this by default (depends on the FC's stream-rate config for
+            # this serial port), so without asking for it lat/lon just silently sit at
+            # None forever. MAV_CMD_SET_MESSAGE_INTERVAL asks for it directly regardless
+            # of whatever the default rates are.
+            try:
+                m_fc.mav.command_long_send(
+                    m_fc.target_system,
+                    m_fc.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
+                    200000,  # microseconds -> 5 Hz
+                    0, 0, 0, 0, 0,
+                )
+                print("MAVLINK: requested GLOBAL_POSITION_INT at 5 Hz")
+            except Exception as e:
+                print("MAVLINK: failed to request GLOBAL_POSITION_INT: %s" % e)
+
         # CHANGED: UART-only. Send payloads back through the flight-controller link.
         payload_link = m_fc
 
@@ -676,17 +719,40 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
         last_lat = None
         last_lon = None
         last_ping = time.time()
+        dbg_prev_iter_start = time.monotonic()
 
         while not stop_evt.is_set():
+
+            if DEBUG_TRIGGER_TIMING:
+                iter_start = time.monotonic()
+                idle_gap = iter_start - dbg_prev_iter_start
+                if idle_gap > 0.5:
+                    # Time between the END of the previous iteration and the START of
+                    # this one. If this is large, something AFTER recv_match in the
+                    # previous pass was slow (BLE queue puts, file I/O, prints, etc.) --
+                    # i.e. the bottleneck is in this script, not the MAVLink link.
+                    print("[LOOP-DEBUG] %.3fs elapsed since previous loop iteration finished" % idle_gap)
+                dbg_prev_iter_start = iter_start
 
             # CHANGED: HEARTBEAT selects exactly one trigger source.
             # AUTO mode: process only SERVO_OUTPUT_RAW from mission DO_SET_SERVO.
             # Non-AUTO modes: process only RC_CHANNELS from the manual radio.
             msg = m_fc.recv_match(
-                type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW"],
+                type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "GLOBAL_POSITION_INT"],
                 blocking=True,
                 timeout=2,
             )
+
+            if DEBUG_TRIGGER_TIMING:
+                recv_dt = time.monotonic() - iter_start
+                if recv_dt > 0.5:
+                    # Time recv_match() itself took to return. If this is large, the
+                    # bottleneck is upstream: the FC isn't sending matching messages
+                    # promptly, or there's a backlog on the link.
+                    print(
+                        "[LOOP-DEBUG] recv_match blocked %.3fs, returned %s"
+                        % (recv_dt, msg.get_type() if msg else None)
+                    )
 
             flags = {
                 "deploy_needed": False,
@@ -737,6 +803,18 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         handle_trigger_pwm(msg, fsm_st)
                         flags = fsm_consume_flags(fsm_st)
 
+                elif msg_type == "GLOBAL_POSITION_INT":
+                    # Keep a running current position so it can be locked in at the exact
+                    # moment of deploy below, not re-read later at fetch/upload time once
+                    # the drone may have already lifted off and moved on.
+                    if last_lat is None:
+                        print(
+                            "MAVLINK: first GLOBAL_POSITION_INT received, lat=%s lon=%s"
+                            % (msg.lat / 1e7, msg.lon / 1e7)
+                        )
+                    last_lat = msg.lat / 1e7
+                    last_lon = msg.lon / 1e7
+
                 if flags["cycle_activated"]:
                     pass
 
@@ -746,8 +824,16 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     else:
                         fsm_st["deploy_allowed"] = False   # lock it immediately
 
-                        print("EVENT: start BLE sampling")
-                        q_ble.put({"action": "START"})
+                        # Lock the sampling location in now, at the rising edge, while it is
+                        # still fresh, not later once the drone may have already taken back
+                        # off. No BLE command needed here: the sensor starts sampling itself.
+                        blest["deploy_lat"] = last_lat
+                        blest["deploy_lon"] = last_lon
+
+                        print(
+                            "EVENT: winch release, sensor auto-starts sampling, lat=%s lon=%s"
+                            % (last_lat, last_lon)
+                        )
                         q_winch.put({"action": "RELEASE"})
 
                         freefall_sec = wincfg["FREEFALL_SEC"]
@@ -759,8 +845,12 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         pending_retract_timer = threading.Timer(freefall_sec, enqueue_retract)
                         pending_retract_timer.daemon = True
                         pending_retract_timer.start()
-                 
+
                 if flags["send_to_gcs"]:
+                    print(
+                        "EVENT: requesting data to send to gcs, lat=%s lon=%s"
+                        % (last_lat, last_lon)
+                    )
                     sensor_state["failed"] = resend_buffer(payload_link, sensor_state.get("failed", {}))
 
                     if data_sim_flag is True:
@@ -774,20 +864,24 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     print("EVENT: cycle_deactivated")
                     q_winch.put({"action": "NEUTRAL"})
 
+            # Non-blocking: recv_match() above already provides the natural pacing (it
+            # blocks up to 2s only when the FC link is genuinely idle, and returns
+            # immediately when messages are already buffered). Blocking here for up to
+            # 0.1s on every single loop pass artificially capped how fast this loop could
+            # drain incoming MAVLink traffic to ~10/sec -- fine over a real 115200-baud
+            # UART, which can't produce messages faster than that anyway, but against a
+            # simulator/network link pushing messages much faster, a backlog builds up
+            # behind that cap and the lag between a real RC/servo event and this code
+            # seeing it grows the longer it runs.
             try:
-                cmd = q_mav.get(timeout=0.1)
+                cmd = q_mav.get_nowait()
                 print("cmd:%s" % cmd)
             except queue.Empty:
                 continue
 
             action = (cmd.get("action") or "").upper()
             print("mav action:%s" % action)
-            '''
-            if action == "SENDPAYLOAD":
-                cols = blest["last_cols"]
-                print("Uploading fetched BLE data: cols:%s" % cols)
-                send_payload(payload_link, cols, sensor_state)
-            '''
+
             if action == "SENDPAYLOAD":
                 cols = blest.get("last_cols")
 
@@ -807,7 +901,6 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     print("SENDPAYLOAD failed, MAV thread will continue: %s" % e)
                     print(traceback.format_exc())
                     continue
-
 
     except Exception as e:
         print("MAVLINK thread crashed: %s" % e)
@@ -837,7 +930,7 @@ def main():
         name="BLE",
         args=(stop_evt, q_ble, q_mav, ble_st),
     )
-    
+
     def cleanup(*_args):
         print("Stopping")
         stop_evt.set()
@@ -846,7 +939,7 @@ def main():
         t_win.join(timeout=0.5)
         t_ble.join(timeout=0.5)
         sys.exit(0)
-    
+
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
