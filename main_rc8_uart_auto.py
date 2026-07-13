@@ -123,9 +123,11 @@ CACHE_DIR = "cache"
 sensor_upload_failed = {}
 sensor_state = {"seq": 0}
 
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
-    filename="companion_computer.log",
+    filename="cc_{timestamp}.log",
     encoding="utf-8",
     level=logging.INFO,
 )
@@ -910,6 +912,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    logging.info("adc_sim_flag: %s" % adc_sim_flag)
     stop_evt = threading.Event()
     q_winch = queue.Queue()
     q_ble = queue.Queue()
