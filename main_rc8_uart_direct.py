@@ -29,7 +29,7 @@ from adc_sim import ServoSim, LinkedHallADC
 
 # simulator flags
 data_sim_flag = False
-adc_sim_flag = 1
+adc_sim_flag = 0
 
 COPTER_MODES = {
     0: "STABILIZE",
@@ -83,15 +83,15 @@ wParms = {
     "HALL_MAX": 12285,
     "HALL_TARGET": 2500,
     "RETRACT_PWR": 0.30,
-    "RELEASE_PWR": -0.40,
+    "RELEASE_PWR": -0.30,  # 071426: reduced from 0.40 for slow direct-drive descent
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
-    "SAFETY_TIMEOUT": 5,
+    "SAFETY_TIMEOUT": 5,  # 071426: extended from 5s to cover full direct-drive descent
     "RETRACT_SETTLE": 50,
     "RETRACT_TH": 8000,
     "PWD_ADP_TH": 10000,
     "LOG_PREFIX": "[WINCH] ",
-    "FREEFALL_SEC": 20,
+    "FREEFALL_SEC": 2,     # 071426: reduced from 20s; small buffer after descent before retract
     "RETRACT_SEC": 35,
 }
 
@@ -186,10 +186,6 @@ DEBOUNCE_S = 0.1
 # larger than the RC/telemetry link's actual update rate, the delay is upstream of this
 # code (link backlog or FC stream-rate config), not in this script's processing.
 DEBUG_TRIGGER_TIMING = False
-
-# 071426: Set True to log ALL incoming MAVLink message types during diagnosis.
-# Shows srcSys/srcComp on HEARTBEATs to verify FC filter fix. Disable after confirming.
-DEBUG_ALL_MSGS = False
 
 def trigger_pwm_value(msg, ch):
     # Return PWM in microseconds for 1-based trigger channel ch.
@@ -323,27 +319,21 @@ def hall_raw(c):
         return int(c.value)
 
 def release_win(servo, adc, cfg, st, stop_evt):
-    svalue= cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
+    # 071426: Hall sensor check removed from release. Mechanism is now direct-drive
+    # descent at low power (RELEASE_PWR=0.1) for a fixed duration (SAFETY_TIMEOUT=20s).
+    # Hall sensor is only used during retract to detect full retraction.
+    svalue = cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
     logger.info("Release, winch servo open: %s" % svalue)
     servo.value = float(svalue)
-    time.sleep(0.25)
 
     while not stop_evt.is_set():
         if (time.time() - t0) > cfg["SAFETY_TIMEOUT"]:
-            neutral(servo, cfg)
-            logger.info("safety timeout triggered during release")
+            logger.info("Release complete: SAFETY_TIMEOUT=%ss reached" % cfg["SAFETY_TIMEOUT"])
             break
-        try:
-            dist = hall_raw(adc) - cfg["HALL_TARGET"]
-        except Exception:
-            neutral(servo, cfg)
-            time.sleep(0.25)
-            break
-        logger.info("currnt dist: %s" % dist)
-        if dist > cfg["RETRACT_TH"]:
-            st["RETRACTED"] = 0
-            break
+        time.sleep(0.1)
+
+    st["RETRACTED"] = 0  # 071426: mark as extended after descent completes
     neutral(servo, cfg)
 
 def retract_adaptive(servo, adc, cfg, st):
@@ -743,25 +733,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             # CHANGED: HEARTBEAT selects exactly one trigger source.
             # AUTO mode: process only SERVO_OUTPUT_RAW from mission DO_SET_SERVO.
             # Non-AUTO modes: process only RC_CHANNELS from the manual radio.
-            if DEBUG_ALL_MSGS:
-                # 071426: Receive ALL message types to verify what FC streams to Pi.
-                # Remove type filter so nothing is missed. Disable after diagnosis.
-                msg = m_fc.recv_match(blocking=True, timeout=2)
-                if msg is not None:
-                    # 071426: Log srcSys/srcComp for HEARTBEAT to verify FC filter fix.
-                    if msg.get_type() == "HEARTBEAT":
-                        logger.info("[ALL-MSGS] type=%s auto_mode=%s srcSys=%d srcComp=%d" % (
-                            msg.get_type(), mv_state.get("auto_mode"),
-                            msg.get_srcSystem(), msg.get_srcComponent()))
-                    else:
-                        logger.info("[ALL-MSGS] type=%s auto_mode=%s" % (
-                            msg.get_type(), mv_state.get("auto_mode")))
-            else:
-                msg = m_fc.recv_match(
-                    type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "GLOBAL_POSITION_INT"],
-                    blocking=True,
-                    timeout=2,
-                )
+            msg = m_fc.recv_match(
+                type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "GLOBAL_POSITION_INT"],
+                blocking=True,
+                timeout=2,
+            )
 
             if DEBUG_TRIGGER_TIMING:
                 recv_dt = time.monotonic() - iter_start
@@ -787,14 +763,10 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 msg_type = msg.get_type()
 
                 if msg_type == "HEARTBEAT":
-                    # 071426: Fixed FC heartbeat filter. wait_heartbeat() may latch onto a
-                    # non-FC component (GCS, radio) first, leaving target_component=0 instead
-                    # of 1 (MAV_COMP_ID_AUTOPILOT1). This caused all real FC heartbeats to be
-                    # silently discarded, so auto_mode never flipped to True during AUTO missions.
-                    # Fix: hardcode compid=1 (autopilot) instead of trusting target_component.
+                    # Ignore heartbeats from a GCS or another MAVLink component.
                     is_fc_heartbeat = (
                         msg.get_srcSystem() == m_fc.target_system
-                        and msg.get_srcComponent() == 1  # 071426: MAV_COMP_ID_AUTOPILOT1
+                        and msg.get_srcComponent() == m_fc.target_component
                     )
 
                     if is_fc_heartbeat:

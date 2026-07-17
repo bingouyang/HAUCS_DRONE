@@ -187,9 +187,10 @@ DEBOUNCE_S = 0.1
 # code (link backlog or FC stream-rate config), not in this script's processing.
 DEBUG_TRIGGER_TIMING = False
 
-# 071426: Set True to log ALL incoming MAVLink message types during diagnosis.
-# Shows srcSys/srcComp on HEARTBEATs to verify FC filter fix. Disable after confirming.
-DEBUG_ALL_MSGS = False
+# Set True to log ALL incoming MAVLink message types (not just the filtered ones).
+# Use this to diagnose what the FC is actually streaming to the Pi during AUTO mode.
+# Disable after diagnosis -- it will flood the log.
+DEBUG_ALL_MSGS = True
 
 def trigger_pwm_value(msg, ch):
     # Return PWM in microseconds for 1-based trigger channel ch.
@@ -679,8 +680,13 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
     try:
         m_fc = mavutil.mavlink_connection(FC_CONN_STR, baud=FC_BAUD)
 
+
+
         logger.info("MAVLINK: waiting for HEARTBEAT from Cube...")
         hb = m_fc.wait_heartbeat(timeout=10)
+        
+        logger.info("MAVLINK: target_system=%d target_component=%d" % (
+            m_fc.target_system, m_fc.target_component))
 
         if not hb:
             logger.info("MAVLINK: no HEARTBEAT in 10s (check UART wiring, baud, serial port)")
@@ -744,18 +750,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             # AUTO mode: process only SERVO_OUTPUT_RAW from mission DO_SET_SERVO.
             # Non-AUTO modes: process only RC_CHANNELS from the manual radio.
             if DEBUG_ALL_MSGS:
-                # 071426: Receive ALL message types to verify what FC streams to Pi.
-                # Remove type filter so nothing is missed. Disable after diagnosis.
+                # Receive ALL message types so we can see exactly what the FC is sending.
                 msg = m_fc.recv_match(blocking=True, timeout=2)
                 if msg is not None:
-                    # 071426: Log srcSys/srcComp for HEARTBEAT to verify FC filter fix.
-                    if msg.get_type() == "HEARTBEAT":
-                        logger.info("[ALL-MSGS] type=%s auto_mode=%s srcSys=%d srcComp=%d" % (
-                            msg.get_type(), mv_state.get("auto_mode"),
-                            msg.get_srcSystem(), msg.get_srcComponent()))
-                    else:
-                        logger.info("[ALL-MSGS] type=%s auto_mode=%s" % (
-                            msg.get_type(), mv_state.get("auto_mode")))
+                    logger.info("[ALL-MSGS] type=%s auto_mode=%s" % (
+                        msg.get_type(), mv_state.get("auto_mode")))
             else:
                 msg = m_fc.recv_match(
                     type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "GLOBAL_POSITION_INT"],
@@ -787,14 +786,10 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 msg_type = msg.get_type()
 
                 if msg_type == "HEARTBEAT":
-                    # 071426: Fixed FC heartbeat filter. wait_heartbeat() may latch onto a
-                    # non-FC component (GCS, radio) first, leaving target_component=0 instead
-                    # of 1 (MAV_COMP_ID_AUTOPILOT1). This caused all real FC heartbeats to be
-                    # silently discarded, so auto_mode never flipped to True during AUTO missions.
-                    # Fix: hardcode compid=1 (autopilot) instead of trusting target_component.
+                    # Ignore heartbeats from a GCS or another MAVLink component.
                     is_fc_heartbeat = (
                         msg.get_srcSystem() == m_fc.target_system
-                        and msg.get_srcComponent() == 1  # 071426: MAV_COMP_ID_AUTOPILOT1
+                        and msg.get_srcComponent() == m_fc.target_component
                     )
 
                     if is_fc_heartbeat:

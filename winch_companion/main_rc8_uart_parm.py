@@ -29,7 +29,7 @@ from adc_sim import ServoSim, LinkedHallADC
 
 # simulator flags
 data_sim_flag = False
-adc_sim_flag = 1
+adc_sim_flag = 0
 
 COPTER_MODES = {
     0: "STABILIZE",
@@ -86,13 +86,13 @@ wParms = {
     "RELEASE_PWR": -0.40,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
-    "SAFETY_TIMEOUT": 5,
+    "RELEASE_SEC": 20,      # 071426: motor drives payload down; overridden by SCR_USER1
     "RETRACT_SETTLE": 50,
     "RETRACT_TH": 8000,
     "PWD_ADP_TH": 10000,
     "LOG_PREFIX": "[WINCH] ",
-    "FREEFALL_SEC": 20,
-    "RETRACT_SEC": 35,
+    "PAUSE_SEC": 2,         # 071426: idle at bottom before retract; overridden by SCR_USER2
+    "RETRACT_SEC": 35,      # 071426: motor drives payload up; overridden by SCR_USER3
 }
 
 # BLE parms
@@ -186,10 +186,6 @@ DEBOUNCE_S = 0.1
 # larger than the RC/telemetry link's actual update rate, the delay is upstream of this
 # code (link backlog or FC stream-rate config), not in this script's processing.
 DEBUG_TRIGGER_TIMING = False
-
-# 071426: Set True to log ALL incoming MAVLink message types during diagnosis.
-# Shows srcSys/srcComp on HEARTBEATs to verify FC filter fix. Disable after confirming.
-DEBUG_ALL_MSGS = False
 
 def trigger_pwm_value(msg, ch):
     # Return PWM in microseconds for 1-based trigger channel ch.
@@ -323,27 +319,21 @@ def hall_raw(c):
         return int(c.value)
 
 def release_win(servo, adc, cfg, st, stop_evt):
-    svalue= cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
+    # 071426: Hall sensor check removed. Mechanism is direct-drive descent at low
+    # power (RELEASE_PWR) for a fixed duration (RELEASE_SEC from SCR_USER1).
+    # Hall sensor is only used during retract to detect full retraction.
+    svalue = cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
-    logger.info("Release, winch servo open: %s" % svalue)
+    logger.info("Release, winch servo open: %s, duration: %ss" % (svalue, cfg["RELEASE_SEC"]))
     servo.value = float(svalue)
-    time.sleep(0.25)
 
     while not stop_evt.is_set():
-        if (time.time() - t0) > cfg["SAFETY_TIMEOUT"]:
-            neutral(servo, cfg)
-            logger.info("safety timeout triggered during release")
+        if (time.time() - t0) > cfg["RELEASE_SEC"]:
+            logger.info("Release complete: RELEASE_SEC=%ss reached" % cfg["RELEASE_SEC"])
             break
-        try:
-            dist = hall_raw(adc) - cfg["HALL_TARGET"]
-        except Exception:
-            neutral(servo, cfg)
-            time.sleep(0.25)
-            break
-        logger.info("currnt dist: %s" % dist)
-        if dist > cfg["RETRACT_TH"]:
-            st["RETRACTED"] = 0
-            break
+        time.sleep(0.1)
+
+    st["RETRACTED"] = 0  # 071426: mark as extended after descent completes
     neutral(servo, cfg)
 
 def retract_adaptive(servo, adc, cfg, st):
@@ -670,6 +660,37 @@ def ble_close(ble):
         pass
 
 
+# 071426: ArduPilot SCR_USER parameter mapping for tunable timing.
+# Set these in Mission Planner Full Parameter List before each mission.
+# SCR_USER1 = RELEASE_SEC  (how long motor drives payload down)
+# SCR_USER2 = PAUSE_SEC    (idle time at bottom before retract)
+# SCR_USER3 = RETRACT_SEC  (how long motor drives payload up)
+# If a parameter is 0 or unset, the local wParms default is kept.
+SCR_USER_MAP = {
+    "SCR_USER1": "RELEASE_SEC",
+    "SCR_USER2": "PAUSE_SEC",
+    "SCR_USER3": "RETRACT_SEC",
+}
+
+def fetch_scr_user_params(m_fc, wincfg):
+    # 071426: Called at startup AND right before each release so Mission Planner
+    # changes take effect without restarting the script.
+    for param_name, cfg_key in SCR_USER_MAP.items():
+        try:
+            m_fc.param_fetch_one(param_name)
+            msg = m_fc.recv_match(type="PARAM_VALUE", blocking=True, timeout=3)
+            if msg and msg.param_id.strip('\x00') == param_name and msg.param_value > 0:
+                old = wincfg[cfg_key]
+                wincfg[cfg_key] = float(msg.param_value)
+                logger.info("SCR_USER: %s -> %s = %.1f (was %.1f)" % (
+                    param_name, cfg_key, wincfg[cfg_key], old))
+            else:
+                logger.info("SCR_USER: %s not set or zero, keeping default %s=%.1f" % (
+                    param_name, cfg_key, wincfg[cfg_key]))
+        except Exception as e:
+            logger.info("071426 SCR_USER: failed to fetch %s: %s" % (param_name, e))
+
+
 def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
     if "failed" not in sensor_state:
         sensor_state["failed"] = load_buffer(BUFFER_PATH)
@@ -717,8 +738,13 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             except Exception as e:
                 logger.info("MAVLINK: failed to request GLOBAL_POSITION_INT: %s" % e)
 
+            # 071426: Fetch SCR_USER timing params from FC at startup.
+            fetch_scr_user_params(m_fc, wincfg)
+
         # CHANGED: UART-only. Send payloads back through the flight-controller link.
         payload_link = m_fc
+        # 071426: Store m_fc ref so fetch_scr_user_params can be called before each release.
+        mav_fc_ref = m_fc
 
         sensor_state["failed"] = resend_buffer(payload_link, sensor_state.get("failed", {}))
 
@@ -743,25 +769,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             # CHANGED: HEARTBEAT selects exactly one trigger source.
             # AUTO mode: process only SERVO_OUTPUT_RAW from mission DO_SET_SERVO.
             # Non-AUTO modes: process only RC_CHANNELS from the manual radio.
-            if DEBUG_ALL_MSGS:
-                # 071426: Receive ALL message types to verify what FC streams to Pi.
-                # Remove type filter so nothing is missed. Disable after diagnosis.
-                msg = m_fc.recv_match(blocking=True, timeout=2)
-                if msg is not None:
-                    # 071426: Log srcSys/srcComp for HEARTBEAT to verify FC filter fix.
-                    if msg.get_type() == "HEARTBEAT":
-                        logger.info("[ALL-MSGS] type=%s auto_mode=%s srcSys=%d srcComp=%d" % (
-                            msg.get_type(), mv_state.get("auto_mode"),
-                            msg.get_srcSystem(), msg.get_srcComponent()))
-                    else:
-                        logger.info("[ALL-MSGS] type=%s auto_mode=%s" % (
-                            msg.get_type(), mv_state.get("auto_mode")))
-            else:
-                msg = m_fc.recv_match(
-                    type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "GLOBAL_POSITION_INT"],
-                    blocking=True,
-                    timeout=2,
-                )
+            msg = m_fc.recv_match(
+                type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "GLOBAL_POSITION_INT"],
+                blocking=True,
+                timeout=2,
+            )
 
             if DEBUG_TRIGGER_TIMING:
                 recv_dt = time.monotonic() - iter_start
@@ -787,14 +799,10 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 msg_type = msg.get_type()
 
                 if msg_type == "HEARTBEAT":
-                    # 071426: Fixed FC heartbeat filter. wait_heartbeat() may latch onto a
-                    # non-FC component (GCS, radio) first, leaving target_component=0 instead
-                    # of 1 (MAV_COMP_ID_AUTOPILOT1). This caused all real FC heartbeats to be
-                    # silently discarded, so auto_mode never flipped to True during AUTO missions.
-                    # Fix: hardcode compid=1 (autopilot) instead of trusting target_component.
+                    # Ignore heartbeats from a GCS or another MAVLink component.
                     is_fc_heartbeat = (
                         msg.get_srcSystem() == m_fc.target_system
-                        and msg.get_srcComponent() == 1  # 071426: MAV_COMP_ID_AUTOPILOT1
+                        and msg.get_srcComponent() == m_fc.target_component
                     )
 
                     if is_fc_heartbeat:
@@ -858,15 +866,18 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                             "EVENT: winch release, sensor auto-starts sampling, lat=%s lon=%s"
                             % (last_lat, last_lon)
                         )
+                        # 071426: Re-fetch SCR_USER params right before release so any
+                        # Mission Planner changes since startup are picked up immediately.
+                        fetch_scr_user_params(mav_fc_ref, wincfg)
                         q_winch.put({"action": "RELEASE"})
 
-                        freefall_sec = wincfg["FREEFALL_SEC"]
+                        pause_sec = wincfg["PAUSE_SEC"]
                         retract_sec = wincfg["RETRACT_SEC"]
 
                         def enqueue_retract():
                             q_winch.put({"action": "RETRACT", "duration": retract_sec})
 
-                        pending_retract_timer = threading.Timer(freefall_sec, enqueue_retract)
+                        pending_retract_timer = threading.Timer(pause_sec, enqueue_retract)
                         pending_retract_timer.daemon = True
                         pending_retract_timer.start()
 
