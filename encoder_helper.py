@@ -13,7 +13,19 @@ HEARTBEAT_RATE=1.0
 DATA_BYTES = 96
 HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
 MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
-SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
+SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower).
+
+# Per-variable scale factors — must match SCALE_MAP in sampling_helper.py exactly.
+# Pressure spans ~90 hPa which overflows int8 at SCALE=32 (max +-4 hPa from base).
+SCALE_MAP = {
+    0: 1,    # time          -- integer seconds, +-127s range from base
+    1: 32,   # DO
+    2: 32,   # temp
+    3: 1,    # pressure       -- 1 hPa resolution, +-127 hPa range from base
+    4: 32,   # init_DO
+    5: 1,    # init_pressure
+    6: 32,   # batt_v
+}
 # set or read the two high bits in var_len (payload[7])
 FLAG_NONE = 0
 FLAG_EOF  = 1  # end of frame
@@ -64,6 +76,7 @@ def chunker(values, n):
 
 def build_frames(values, var_id, start_seq, is_resend=False):
     seq = start_seq
+    scale = SCALE_MAP.get(int(var_id), SCALE)  # per-variable scale
 
     if not values:
         return
@@ -76,7 +89,7 @@ def build_frames(values, var_id, start_seq, is_resend=False):
         residues = []
 
         for v in chunk:
-            r = int(round((v - var_base) * SCALE))
+            r = int(round((v - var_base) * scale))
             if r < -128:
                 r = -128
             if r > 127:

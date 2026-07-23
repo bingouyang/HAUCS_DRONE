@@ -127,7 +127,7 @@ timestamp = datetime.now().strftime("%y%m%d_%H%M")
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
-    filename=f"cc_{timestamp}.log",
+    filename=f"logs/cc_{timestamp}.log",
     encoding="utf-8",
     level=logging.INFO,
 )
