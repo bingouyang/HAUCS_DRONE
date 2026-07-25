@@ -127,7 +127,7 @@ timestamp = datetime.now().strftime("%y%m%d_%H%M")
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
-    filename=f"logs/cc_{timestamp}.log",
+    filename=f"cc_{timestamp}.log",
     encoding="utf-8",
     level=logging.INFO,
 )
@@ -660,17 +660,21 @@ def ble_close(ble):
         pass
 
 
-# 071426: ArduPilot SCR_USER parameter mapping for tunable timing.
+# 071426: ArduPilot SCR_USER parameter mapping.
 # Set these in Mission Planner Full Parameter List before each mission.
 # SCR_USER1 = RELEASE_SEC  (how long motor drives payload down)
 # SCR_USER2 = PAUSE_SEC    (idle time at bottom before retract)
 # SCR_USER3 = RETRACT_SEC  (how long motor drives payload up)
-# If a parameter is 0 or unset, the local wParms default is kept.
+# SCR_USER4 = shutdown flag (set to 1 in Mission Planner to cleanly shut down Pi)
+#             Pi polls this each loop; triggers "sudo shutdown -h now" when == 1
+# If a timing parameter is 0 or unset, the local wParms default is kept.
 SCR_USER_MAP = {
     "SCR_USER1": "RELEASE_SEC",
     "SCR_USER2": "PAUSE_SEC",
     "SCR_USER3": "RETRACT_SEC",
 }
+SCR_USER_SHUTDOWN = "SCR_USER4"   # set to 1 in Mission Planner to trigger Pi shutdown
+SCR_USER_SHUTDOWN_POLL_SEC = 5.0  # how often to poll SCR_USER4 (seconds)
 
 def fetch_scr_user_params(m_fc, wincfg):
     # 071426: Called at startup AND right before each release so Mission Planner
@@ -898,6 +902,32 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 if flags["cycle_deactivated"]:
                     logger.info("EVENT: cycle_deactivated")
                     q_winch.put({"action": "NEUTRAL"})
+
+            # 071426: Poll SCR_USER4 periodically for Pi shutdown request.
+            # Set SCR_USER4 = 1 in Mission Planner to trigger a clean shutdown.
+            # Use this before cutting drone power to protect the SD card.
+            if not hasattr(mav_thread, '_last_shutdown_poll'):
+                mav_thread._last_shutdown_poll = 0.0
+            if time.time() - mav_thread._last_shutdown_poll > SCR_USER_SHUTDOWN_POLL_SEC:
+                mav_thread._last_shutdown_poll = time.time()
+                try:
+                    m_fc.param_fetch_one(SCR_USER_SHUTDOWN)
+                    pmsg = m_fc.recv_match(type="PARAM_VALUE", blocking=True, timeout=2)
+                    if (pmsg and pmsg.param_id.strip('\x00') == SCR_USER_SHUTDOWN
+                            and int(pmsg.param_value) == 1):
+                        logger.info("SCR_USER4 == 1: Pi shutdown requested from Mission Planner")
+                        # 071426: Reset SCR_USER4 back to 0 before shutting down
+                        # so the next boot does not immediately trigger another shutdown.
+                        try:
+                            m_fc.param_set_send(SCR_USER_SHUTDOWN, 0)
+                            logger.info("SCR_USER4 reset to 0 on FC")
+                        except Exception as _re:
+                            logger.info("SCR_USER4 reset failed: %s" % _re)
+                        logger.info("Running: sudo shutdown -h now")
+                        import os as _os
+                        _os.system("sudo shutdown -h now")
+                except Exception as _e:
+                    logger.info("SCR_USER4 poll failed: %s" % _e)
 
             # Non-blocking: recv_match() above already provides the natural pacing (it
             # blocks up to 2s only when the FC link is genuinely idle, and returns
