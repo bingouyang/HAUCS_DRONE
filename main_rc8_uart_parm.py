@@ -319,9 +319,27 @@ def hall_raw(c):
         return int(c.value)
 
 def release_win(servo, adc, cfg, st, stop_evt):
-    # 071426: Hall sensor check removed. Mechanism is direct-drive descent at low
-    # power (RELEASE_PWR) for a fixed duration (RELEASE_SEC from SCR_USER1).
-    # Hall sensor is only used during retract to detect full retraction.
+    # 071426: Hall sensor check removed from early-exit logic. Mechanism is
+    # direct-drive descent at low power (RELEASE_PWR) for RELEASE_SEC duration.
+    # However, Hall sensor is still used as a polarity/direction safeguard:
+    #   - Pre-check: if sensor reads high before release, polarity may be reversed
+    #   - Mid-check: if sensor goes DOWN during release, motor is running backwards
+
+    # --- Pre-release Hall sensor sanity check ---
+    try:
+        hall_start = hall_raw(adc)
+        if hall_start > cfg["RETRACT_TH"]:
+            logger.info("SAFETY ABORT: Hall sensor reads %d before release "
+                        "(expected near %d). Possible polarity reversal or "
+                        "winch already deployed. Aborting release." %
+                        (hall_start, cfg["HALL_TARGET"]))
+            neutral(servo, cfg)
+            return
+        logger.info("Hall pre-check OK: %d (threshold %d)" % (hall_start, cfg["RETRACT_TH"]))
+    except Exception as e:
+        logger.info("Hall pre-check failed: %s — proceeding with release" % e)
+        hall_start = None
+
     svalue = cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
     logger.info("Release, winch servo open: %s, duration: %ss" % (svalue, cfg["RELEASE_SEC"]))
@@ -331,14 +349,47 @@ def release_win(servo, adc, cfg, st, stop_evt):
         if (time.time() - t0) > cfg["RELEASE_SEC"]:
             logger.info("Release complete: RELEASE_SEC=%ss reached" % cfg["RELEASE_SEC"])
             break
+
+        # --- Mid-release Hall sensor direction check ---
+        # If sensor reading is decreasing, motor is running backwards (polarity reversed)
+        if hall_start is not None and (time.time() - t0) > 1.0:
+            try:
+                hall_now = hall_raw(adc)
+                if hall_now < (hall_start - cfg["RETRACT_SETTLE"]):
+                    logger.info("SAFETY ABORT: Hall sensor decreased during release "
+                                "(%d -> %d). Motor running backwards — possible "
+                                "polarity reversal. Aborting release." %
+                                (hall_start, hall_now))
+                    neutral(servo, cfg)
+                    return
+            except Exception as e:
+                logger.info("Hall mid-check failed: %s" % e)
+
         time.sleep(0.1)
 
-    st["RETRACTED"] = 0  # 071426: mark as extended after descent completes
+    st["RETRACTED"] = 0  # mark as extended after descent completes
     neutral(servo, cfg)
 
 def retract_adaptive(servo, adc, cfg, st):
     try:
-        dist = hall_raw(adc) - cfg["HALL_TARGET"]
+        hall_now = hall_raw(adc)
+        dist = hall_now - cfg["HALL_TARGET"]
+
+        # --- Retract polarity safeguard ---
+        # During retract the Hall reading should decrease toward HALL_TARGET.
+        # If it is already near HALL_TARGET or below, something is wrong —
+        # either polarity is reversed (motor extending instead of retracting)
+        # or the sensor is reading incorrectly. Stop immediately.
+        if not hasattr(retract_adaptive, "_hall_start"):
+            retract_adaptive._hall_start = hall_now
+        elif hall_now > retract_adaptive._hall_start + cfg["RETRACT_SETTLE"]:
+            logger.info("SAFETY ABORT: Hall sensor increased during retract "
+                        "(%d -> %d). Motor running backwards — possible "
+                        "polarity reversal. Aborting retract." %
+                        (retract_adaptive._hall_start, hall_now))
+            neutral(servo, cfg)
+            retract_adaptive._hall_start = None
+            return False
 
     except Exception:
         neutral(servo, cfg)
@@ -364,6 +415,7 @@ def retract_adaptive(servo, adc, cfg, st):
     if dist < (cfg["HALL_TARGET"] + cfg["RETRACT_SETTLE"]):
         if st["RETRACTED"] != 1:
             st["RETRACTED"] = 1
+            retract_adaptive._hall_start = None  # reset for next cycle
             fsm_st["deploy_allowed"] = True
             logger.info("Deploy re-enabled (fully retracted)")
             if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
