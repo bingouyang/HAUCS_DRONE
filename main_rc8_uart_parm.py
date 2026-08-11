@@ -102,7 +102,7 @@ wParms = {
 # that instant), so there's no sample_type toggling here at all anymore.
 BLE_SAMPLE_SIZE = 120
 BLE_PMODE = "high"
-BLE_FETCH_TIMEOUT = 5  # seconds of BLE inactivity during sample download
+BLE_FETCH_TIMEOUT = 5
 
 ble_st = {
     "ble": None,
@@ -380,14 +380,13 @@ def retract_adaptive(servo, adc, cfg, st):
         # If it is already near HALL_TARGET or below, something is wrong —
         # either polarity is reversed (motor extending instead of retracting)
         # or the sensor is reading incorrectly. Stop immediately.
-        hall_start = getattr(retract_adaptive, "_hall_start", None)
-        if hall_start is None:
+        if not hasattr(retract_adaptive, "_hall_start"):
             retract_adaptive._hall_start = hall_now
-        elif hall_now > hall_start + cfg["RETRACT_SETTLE"]:
+        elif hall_now > retract_adaptive._hall_start + cfg["RETRACT_SETTLE"]:
             logger.info("SAFETY ABORT: Hall sensor increased during retract "
                         "(%d -> %d). Motor running backwards — possible "
                         "polarity reversal. Aborting retract." %
-                        (hall_start, hall_now))
+                        (retract_adaptive._hall_start, hall_now))
             neutral(servo, cfg)
             retract_adaptive._hall_start = None
             return False
@@ -409,12 +408,11 @@ def retract_adaptive(servo, adc, cfg, st):
 
     if pwr > cfg["RETRACT_PWR"]:
         pwr = cfg["RETRACT_PWR"]
-    elif pwr < 0:
+
+    else:
         pwr = 0
 
-    # dist is already hall_now - HALL_TARGET, so compare it directly
-    # with RETRACT_SETTLE. Do not add HALL_TARGET a second time.
-    if dist < cfg["RETRACT_SETTLE"]:
+    if dist < (cfg["HALL_TARGET"] + cfg["RETRACT_SETTLE"]):
         if st["RETRACTED"] != 1:
             st["RETRACTED"] = 1
             retract_adaptive._hall_start = None  # reset for next cycle
@@ -496,26 +494,10 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 if act == "RELEASE":
                     release_win(servo, adc, cfg, st, stop_evt)
 
-                    if stop_evt.is_set():
-                        continue
-
-                    # SCR_USER2 starts only after release_win() actually finishes.
-                    pause_sec = float(cmd.get("pause", cfg["PAUSE_SEC"]))
-                    retract_sec = float(cmd.get("retract_duration", cfg["RETRACT_SEC"]))
-                    logger.info("Release finished. Idle at bottom for %.1f sec" % pause_sec)
-
-                    if stop_evt.wait(pause_sec):
-                        continue
-
-                    logger.info("Bottom pause finished. Queue RETRACT with timeout %.1f sec" % retract_sec)
-                    q_winch.put({"action": "RETRACT", "duration": retract_sec})
-
                 elif act == "RETRACT":
                     dur = float(cmd.get("duration", 0.0))
                     logger.info("RETRACT for %ss" % dur)
                     t0 = time.time()
-                    # Start each retract with a fresh Hall-direction baseline.
-                    retract_adaptive._hall_start = None
                     servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"]
                     logger.info("servo.value %s" % servo.value)
                     time.sleep(0.25)
@@ -528,7 +510,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                         time.sleep(0.1)
                     if (time.time() - t0) >= dur:
                         logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
-                    retract_adaptive._hall_start = None
+                    retract_flag = True
                     neutral(servo, cfg)
 
                 elif act == "NEUTRAL":
@@ -633,7 +615,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             sflag = ble.get_sampl_flag()
                             logger.info("stop sampling sampling flag: %s" % sflag)
                             s_size = ble.get_sample_size()
-                            ok = bool(ble.get_sample_data(BLE_FETCH_TIMEOUT))
+                            ok = bool(ble.get_sample_data())
                             st["sampling"] = False
                             logger.info(
                                 "finish sampling - queue mav cmd to upload data, ok: %s, sample_size:%s"
@@ -734,7 +716,7 @@ def ble_close(ble):
 # Set these in Mission Planner Full Parameter List before each mission.
 # SCR_USER1 = RELEASE_SEC  (how long motor drives payload down)
 # SCR_USER2 = PAUSE_SEC    (idle time at bottom before retract)
-# SCR_USER3 = RETRACT_SEC  (maximum retract duration / safety timeout)
+# SCR_USER3 = RETRACT_SEC  (how long motor drives payload up)
 # SCR_USER4 = shutdown flag (set to 1 in Mission Planner to cleanly shut down Pi)
 #             Pi polls this each loop; triggers "sudo shutdown -h now" when == 1
 # If a timing parameter is 0 or unset, the local wParms default is kept.
@@ -943,11 +925,17 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         # 071426: Re-fetch SCR_USER params right before release so any
                         # Mission Planner changes since startup are picked up immediately.
                         fetch_scr_user_params(mav_fc_ref, wincfg)
-                        q_winch.put({
-                            "action": "RELEASE",
-                            "pause": wincfg["PAUSE_SEC"],
-                            "retract_duration": wincfg["RETRACT_SEC"],
-                        })
+                        q_winch.put({"action": "RELEASE"})
+
+                        pause_sec = wincfg["PAUSE_SEC"]
+                        retract_sec = wincfg["RETRACT_SEC"]
+
+                        def enqueue_retract():
+                            q_winch.put({"action": "RETRACT", "duration": retract_sec})
+
+                        pending_retract_timer = threading.Timer(pause_sec, enqueue_retract)
+                        pending_retract_timer.daemon = True
+                        pending_retract_timer.start()
 
                 if flags["send_to_gcs"]:
                     logger.info(
