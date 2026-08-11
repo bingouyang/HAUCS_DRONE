@@ -184,9 +184,13 @@ class BluetoothReader(QObject):
         self.prev_sample_size = 0
         self.current_sample_size = 0
 
-    def get_sample_data(self):
-        msg = self.send_receive_command(self.commands['s_print'], timeout=5)
+    def get_sample_data(self, timeout=5):
+        # For sample_print, timeout is an inactivity timeout: the transfer may
+        # take much longer than this as long as BLE data keeps arriving.
+        msg = self.send_receive_command(self.commands['s_print'], timeout=timeout)
         print(f'get_sample_data rcvd msg:{msg}')
+        if not msg:
+            return False
         return msg[0] == 'dfinish'
     
     def set_calibration_pressure(self):
@@ -295,17 +299,20 @@ class BluetoothReader(QObject):
             #print(f"ble outgoing cmd: {command['tx']}")
 
             uart_service.write((command['tx'] + "\n").encode())
-            start_time = time.time()
+            # Timeout is based on BLE inactivity, not total command duration.
+            # This is important for sample_print, which can stream many lines.
+            last_rx_time = time.monotonic()
             while len(command['rx']) > 0:
-                # check timeout
-                if (time.time() - start_time > timeout):
-                    logger.debug('timeout triggered')
+                if (time.monotonic() - last_rx_time > timeout):
+                    logger.warning('BLE receive timeout: no data for %.1f sec', timeout)
                     self.transmission_timeouts += 1
                     return ""
-                # wait till buffer has something
+                # wait till buffer has something; avoid a tight busy-spin
                 if not uart_service.in_waiting:
+                    time.sleep(0.005)
                     continue
-                msg = uart_service.readline().decode()
+                msg = uart_service.readline().decode(errors="ignore")
+                last_rx_time = time.monotonic()
                 msg = msg.replace("\n","")
                 msg = msg.lower()
                 msg = msg.split(",")

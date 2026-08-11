@@ -287,30 +287,61 @@ def prep_sim_data(csv_path="input.csv"):
     return data_cols
 
 ##########################
-VAR_ID_FRAME_END = 127 # indicating frame end.
-FRAME_END_RESEND = 3   # send frame end 3 times.
+VAR_ID_FRAME_END = 127  # indicating frame end
+FRAME_END_RESEND = 3    # send frame end 3 times when live transmission succeeds
+
 def send_payload(m, data_cols, state, path="outbox.json"):
     if "failed" not in state:
         state["failed"] = load_buffer(path)
-        
-    first_seq = state["seq"]  # capture BEFORE creating the packets
+
+    # Build all sensor packets. state["seq"] becomes the next free sequence.
     per_var, state["seq"] = prepare_per_var_queues(data_cols, state["seq"])
-    state["failed"], done = send_or_buffer_all(m, per_var, SEND_ORDER, state["failed"], path)
+
+    # Send sensor packets, buffering any unsent remainder on failure.
+    state["failed"], done = send_or_buffer_all(
+        m, per_var, SEND_ORDER, state["failed"], path
+    )
 
     if done:
         print("Pi done sending batch")
-        
     else:
         print("Pi buffered remaining after failure-network link is down")
 
-    # --- end-of-frame marker (values=["control"] as bytes) ---
-    ctrl_vals = list(b"CONTROL")      # int8 list; length must be <= 63    
-    gen = build_frames(ctrl_vals, VAR_ID_FRAME_END, first_seq)
+    # FRAME_END gets its own sequence AFTER every data packet in this sample.
+    # This makes buffered replay deterministic: resend_buffer() sorts by seq,
+    # therefore all missing data is resent before FRAME_END is resent.
+    end_seq = state["seq"]
+    ctrl_vals = list(b"CONTROL")
+
+    gen = build_frames(ctrl_vals, VAR_ID_FRAME_END, end_seq)
     try:
-        _, end_pkt = next(gen)  # single packet for 7 bytes
+        _, end_pkt = next(gen)
     except StopIteration:
-        return  # shouldn't happen for b"CONTROL
-    
-    for _ in range(FRAME_END_RESEND): #send frame end multple times times.
-        send_packet(m, VAR_ID_FRAME_END, end_pkt, first_seq)
+        return
+
+    # Reserve the control packet sequence before returning from this call.
+    state["seq"] = (end_seq + 1) & 0xFFFFFFFF
+
+    if not done:
+        # Some data is already in outbox.json, so FRAME_END must be buffered too.
+        # Otherwise the base station could commit a partial sampling event.
+        state["failed"] = add_failed(
+            state["failed"], end_seq, VAR_ID_FRAME_END, end_pkt, path
+        )
+        print(f"Pi buffered FRAME_END seq {end_seq}")
+        return
+
+    # All data packets were accepted for live transmission. Send the required
+    # FRAME_END once; if that send itself fails, preserve it in the outbox.
+    if not send_packet(m, VAR_ID_FRAME_END, end_pkt, end_seq):
+        state["failed"] = add_failed(
+            state["failed"], end_seq, VAR_ID_FRAME_END, end_pkt, path
+        )
+        print(f"Pi buffered FRAME_END seq {end_seq}")
+        return
+
+    # Additional copies are redundancy only. The receiver must ignore duplicate
+    # FRAME_END packets with the same seq.
+    for _ in range(FRAME_END_RESEND - 1):
+        send_packet(m, VAR_ID_FRAME_END, end_pkt, end_seq)
         time.sleep(0.1)
