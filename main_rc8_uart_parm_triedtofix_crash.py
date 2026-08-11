@@ -31,6 +31,23 @@ from adc_sim import ServoSim, LinkedHallADC
 data_sim_flag = False
 adc_sim_flag = 0
 
+# Startup direction test flag.
+# Set to True to run a brief direction test at startup to detect Triple4 polarity reversal.
+# The test sends a short retract pulse and checks if Hall sensor moves the right way.
+# If direction is wrong, ROTATION_DIRECTION is automatically flipped for the session.
+# Set to False to skip the test (faster startup, use if direction is known to be correct).
+# Power and duration: higher power/longer duration = more reliable detection but more spool movement.
+# ── Script version ───────────────────────────────────────────────────────────
+# Updated: 2026-07-27
+# Changes: retract_adaptive _state dict fix (second retract bug);
+#          dual-direction startup test (STARTUP_DIR_TEST flag)
+# ─────────────────────────────────────────────────────────────────────────────
+
+STARTUP_DIR_TEST = False        # set True to enable
+STARTUP_DIR_TEST_PWR  = 0.20   # retract power for test; low but enough to detect direction
+STARTUP_DIR_TEST_SEC  = 0.5    # duration in seconds; part of normal initialization sequence
+STARTUP_DIR_TEST_TH   = 50     # minimum Hall delta to consider a valid reading
+
 COPTER_MODES = {
     0: "STABILIZE",
     1: "ACRO",
@@ -82,7 +99,7 @@ wParms = {
     "HALL_MIN": 2500,
     "HALL_MAX": 12285,
     "HALL_TARGET": 2500,
-    "RETRACT_PWR": 0.15,
+    "RETRACT_PWR": 0.30,
     "RELEASE_PWR": -0.40,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
@@ -100,10 +117,9 @@ wParms = {
 # sampling itself off its own pressure sensor. A BLE "manual start" command isn't
 # reliable right at splashdown (the link can be marginal or momentarily lost at exactly
 # that instant), so there's no sample_type toggling here at all anymore.
-BLE_SAMPLE_SIZE = 512
-BLE_SAMPLE_RATE = 2
+BLE_SAMPLE_SIZE = 120
 BLE_PMODE = "high"
-BLE_FETCH_TIMEOUT = 5  # seconds of BLE inactivity during sample download
+BLE_FETCH_TIMEOUT = 5
 
 ble_st = {
     "ble": None,
@@ -381,19 +397,24 @@ def retract_adaptive(servo, adc, cfg, st):
         # If it is already near HALL_TARGET or below, something is wrong —
         # either polarity is reversed (motor extending instead of retracting)
         # or the sensor is reading incorrectly. Stop immediately.
-        hall_start = getattr(retract_adaptive, "_hall_start", None)
-        if hall_start is None:
-            retract_adaptive._hall_start = hall_now
-        elif hall_now > hall_start + cfg["RETRACT_SETTLE"]:
-            logger.info("SAFETY ABORT: Hall sensor increased during retract "
-                        "(%d -> %d). Motor running backwards — possible "
-                        "polarity reversal. Aborting retract." %
-                        (hall_start, hall_now))
-            neutral(servo, cfg)
-            retract_adaptive._hall_start = None
-            return False
+        if not hasattr(retract_adaptive, "_state"):
+            retract_adaptive._state = {"hall_start": None}
+        if retract_adaptive._state["hall_start"] is None:
+            retract_adaptive._state["hall_start"] = hall_now
+            logger.info("Retract polarity check start: hall_start=%d" % hall_now)
+        else:
+            hall_start = retract_adaptive._state["hall_start"]
+            if hall_now > hall_start + cfg["RETRACT_SETTLE"]:
+                logger.info("SAFETY ABORT: Hall sensor increased during retract "
+                            "(%d -> %d). Motor running backwards -- possible "
+                            "polarity reversal. Aborting retract." %
+                            (hall_start, hall_now))
+                neutral(servo, cfg)
+                retract_adaptive._state["hall_start"] = None
+                return False
 
-    except Exception:
+    except Exception as _e:
+        logger.info("retract_adaptive exception: %s" % _e)
         neutral(servo, cfg)
         time.sleep(0.25)
         return False
@@ -410,15 +431,14 @@ def retract_adaptive(servo, adc, cfg, st):
 
     if pwr > cfg["RETRACT_PWR"]:
         pwr = cfg["RETRACT_PWR"]
-    elif pwr < 0:
+
+    else:
         pwr = 0
 
-    # dist is already hall_now - HALL_TARGET, so compare it directly
-    # with RETRACT_SETTLE. Do not add HALL_TARGET a second time.
-    if dist < cfg["RETRACT_SETTLE"]:
+    if dist < (cfg["HALL_TARGET"] + cfg["RETRACT_SETTLE"]):
         if st["RETRACTED"] != 1:
             st["RETRACTED"] = 1
-            retract_adaptive._hall_start = None  # reset for next cycle
+            retract_adaptive._state["hall_start"] = None  # reset for next cycle
             fsm_st["deploy_allowed"] = True
             logger.info("Deploy re-enabled (fully retracted)")
             if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
@@ -485,6 +505,69 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         return
 
     logger.info("winch ready")
+
+    # Startup direction test (controlled by STARTUP_DIR_TEST flag at top of file).
+    # Pulses in BOTH directions and compares Hall deltas to determine correct retract direction.
+    # Whichever direction produces a NEGATIVE Hall delta (spool moves toward retracted)
+    # is the correct retract direction. This works even if power is borderline.
+    if STARTUP_DIR_TEST:
+        try:
+            logger.info("Startup direction test ENABLED (pwr=%.2f sec=%.1fs)" % (
+                STARTUP_DIR_TEST_PWR, STARTUP_DIR_TEST_SEC))
+
+            # --- Pulse A: expected retract direction ---
+            hall_before_a = hall_raw(adc)
+            retract_val = float(-cfg["ROTATION_DIRECTION"] * STARTUP_DIR_TEST_PWR + cfg["NEUTRAL_POS"])
+            logger.info("Direction test A (expected retract): servo=%.3f Hall before=%d" % (
+                retract_val, hall_before_a))
+            servo.value = retract_val
+            time.sleep(STARTUP_DIR_TEST_SEC)
+            neutral(servo, cfg)
+            time.sleep(0.2)
+            hall_after_a = hall_raw(adc)
+            delta_a = hall_after_a - hall_before_a
+            logger.info("Direction test A: Hall after=%d delta=%d" % (hall_after_a, delta_a))
+
+            # --- Pulse B: opposite direction ---
+            hall_before_b = hall_raw(adc)
+            release_val = float(cfg["ROTATION_DIRECTION"] * STARTUP_DIR_TEST_PWR + cfg["NEUTRAL_POS"])
+            logger.info("Direction test B (opposite): servo=%.3f Hall before=%d" % (
+                release_val, hall_before_b))
+            servo.value = release_val
+            time.sleep(STARTUP_DIR_TEST_SEC)
+            neutral(servo, cfg)
+            time.sleep(0.2)
+            hall_after_b = hall_raw(adc)
+            delta_b = hall_after_b - hall_before_b
+            logger.info("Direction test B: Hall after=%d delta=%d" % (hall_after_b, delta_b))
+
+            # --- Evaluate ---
+            if abs(delta_a) < STARTUP_DIR_TEST_TH and abs(delta_b) < STARTUP_DIR_TEST_TH:
+                logger.info("Startup direction test INCONCLUSIVE: both deltas too small "
+                            "(A=%d B=%d threshold=%d). "
+                            "Power too low or spool at both limits. "
+                            "Increase STARTUP_DIR_TEST_PWR or STARTUP_DIR_TEST_SEC. "
+                            "Proceeding with ROTATION_DIRECTION=%d." %
+                            (delta_a, delta_b, STARTUP_DIR_TEST_TH, cfg["ROTATION_DIRECTION"]))
+            elif delta_a <= delta_b:
+                # direction A (expected retract) produced more negative delta -- correct
+                logger.info("Startup direction test PASS: direction A (retract) delta=%d "
+                            "vs B (release) delta=%d -- ROTATION_DIRECTION=%d is correct." %
+                            (delta_a, delta_b, cfg["ROTATION_DIRECTION"]))
+            else:
+                # direction B produced more negative delta -- direction is reversed
+                old_dir = cfg["ROTATION_DIRECTION"]
+                cfg["ROTATION_DIRECTION"] = -cfg["ROTATION_DIRECTION"]
+                logger.info("Startup direction test CORRECTED: direction B delta=%d "
+                            "more negative than A delta=%d -- "
+                            "ROTATION_DIRECTION flipped %d -> %d." %
+                            (delta_b, delta_a, old_dir, cfg["ROTATION_DIRECTION"]))
+
+        except Exception as e:
+            logger.info("Startup direction test error: %s -- proceeding with defaults" % e)
+    else:
+        logger.info("Startup direction test DISABLED (STARTUP_DIR_TEST=False)")
+
     try:
         while not stop_evt.is_set():
             try:
@@ -497,26 +580,10 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 if act == "RELEASE":
                     release_win(servo, adc, cfg, st, stop_evt)
 
-                    if stop_evt.is_set():
-                        continue
-
-                    # SCR_USER2 starts only after release_win() actually finishes.
-                    pause_sec = float(cmd.get("pause", cfg["PAUSE_SEC"]))
-                    retract_sec = float(cmd.get("retract_duration", cfg["RETRACT_SEC"]))
-                    logger.info("Release finished. Idle at bottom for %.1f sec" % pause_sec)
-
-                    if stop_evt.wait(pause_sec):
-                        continue
-
-                    logger.info("Bottom pause finished. Queue RETRACT with timeout %.1f sec" % retract_sec)
-                    q_winch.put({"action": "RETRACT", "duration": retract_sec})
-
                 elif act == "RETRACT":
                     dur = float(cmd.get("duration", 0.0))
                     logger.info("RETRACT for %ss" % dur)
                     t0 = time.time()
-                    # Start each retract with a fresh Hall-direction baseline.
-                    retract_adaptive._hall_start = None
                     servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"]
                     logger.info("servo.value %s" % servo.value)
                     time.sleep(0.25)
@@ -529,7 +596,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                         time.sleep(0.1)
                     if (time.time() - t0) >= dur:
                         logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
-                    retract_adaptive._hall_start = None
+                    retract_flag = True
                     neutral(servo, cfg)
 
                 elif act == "NEUTRAL":
@@ -584,14 +651,6 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
             time.sleep(0.2)
             ble.set_calibration_pressure()
             time.sleep(0.2)
-            ble.set_maxsize(BLE_SAMPLE_SIZE)
-            time.sleep(0.2)
-            ble.set_sample_hz(BLE_SAMPLE_RATE)
-            time.sleep(0.2)
-            logger.info(
-                "BLE sensor init: max_size=%d sample_hz=%.1f"
-                % (BLE_SAMPLE_SIZE, BLE_SAMPLE_RATE)
-            )            
             # No sample_type call needed here -- the sensor already boots in "auto" and
             # nothing in this code ever switches it away from that anymore.
             st["c_status"] = "connected"
@@ -642,7 +701,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             sflag = ble.get_sampl_flag()
                             logger.info("stop sampling sampling flag: %s" % sflag)
                             s_size = ble.get_sample_size()
-                            ok = bool(ble.get_sample_data(BLE_FETCH_TIMEOUT))
+                            ok = bool(ble.get_sample_data())
                             st["sampling"] = False
                             logger.info(
                                 "finish sampling - queue mav cmd to upload data, ok: %s, sample_size:%s"
@@ -743,7 +802,7 @@ def ble_close(ble):
 # Set these in Mission Planner Full Parameter List before each mission.
 # SCR_USER1 = RELEASE_SEC  (how long motor drives payload down)
 # SCR_USER2 = PAUSE_SEC    (idle time at bottom before retract)
-# SCR_USER3 = RETRACT_SEC  (maximum retract duration / safety timeout)
+# SCR_USER3 = RETRACT_SEC  (how long motor drives payload up)
 # SCR_USER4 = shutdown flag (set to 1 in Mission Planner to cleanly shut down Pi)
 #             Pi polls this each loop; triggers "sudo shutdown -h now" when == 1
 # If a timing parameter is 0 or unset, the local wParms default is kept.
@@ -952,11 +1011,17 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         # 071426: Re-fetch SCR_USER params right before release so any
                         # Mission Planner changes since startup are picked up immediately.
                         fetch_scr_user_params(mav_fc_ref, wincfg)
-                        q_winch.put({
-                            "action": "RELEASE",
-                            "pause": wincfg["PAUSE_SEC"],
-                            "retract_duration": wincfg["RETRACT_SEC"],
-                        })
+                        q_winch.put({"action": "RELEASE"})
+
+                        pause_sec = wincfg["PAUSE_SEC"]
+                        retract_sec = wincfg["RETRACT_SEC"]
+
+                        def enqueue_retract():
+                            q_winch.put({"action": "RETRACT", "duration": retract_sec})
+
+                        pending_retract_timer = threading.Timer(pause_sec, enqueue_retract)
+                        pending_retract_timer.daemon = True
+                        pending_retract_timer.start()
 
                 if flags["send_to_gcs"]:
                     logger.info(

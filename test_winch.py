@@ -30,7 +30,7 @@ MIN_PW           = 0.0009
 MAX_PW           = 0.0021
 FRAME            = 0.02
 NEUTRAL_POS      = 0.0
-ROTATION_DIR     = -1      # -1 or 1; flip if motor runs backwards
+ROTATION_DIR     = 1      # -1 or 1; flip if motor runs backwards
 RELEASE_PWR      = 0.10    # power for extend (release)
 RETRACT_PWR      = 0.30    # power for retract
 
@@ -87,7 +87,7 @@ def servo_usec(v):
 def main():
     print()
     print("=" * 60)
-    print("  HAUCS Winch Test — Servo + Hall Sensor")
+    print("  HAUCS Winch Test: Servo and Hall Sensor")
     print("=" * 60)
     print("  ROTATION_DIR : %d" % ROTATION_DIR)
     print("  RELEASE_PWR  : %.2f  (servo value %.3f)" % (

@@ -166,6 +166,12 @@ class BluetoothReader(QObject):
         self.sdata["sample_hz"] = 1
         self.send_receive_command(self.commands['s_rate'])
         return self.sdata['sample_hz']
+
+    def set_sample_hz(self, hz):
+        command = {'tx': 'set sample_hz %.1f' % float(hz), 'rx': ''}
+        self.send_receive_command(command)
+        self.sdata['sample_hz'] = float(hz)
+        logger.info('BLE: set sample_hz to %.1f' % hz)
     
     def get_battery(self):
         self.send_receive_command(self.commands['battery'])
