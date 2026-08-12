@@ -1,55 +1,72 @@
 """
 upload_cached_samples.py
 ------------------------
-Upload cached sample CSVs from the Pi directly to Firebase, bypassing the
-MAVLink encoder path entirely. This restores full precision (decimal pressure,
-correct init_do) for records that were corrupted by encoder scaling issues.
+Upload the Pi's cached sample CSVs straight to Firebase, bypassing the MAVLink
+encoder entirely. Use this to recover casts whose encoded values were clipped
+or quantized in transit.
 
-Cache files are written by cache_sample_csv() in main_rc8_uart_parm.py to:
-    cache/sample_YYYYMMDD_HHMMSS_mmm.csv
+The Pi has no pond map of its own -- pond ID resolution lives on the GCS inside
+MAVProxy (db_helper.get_pond_id). This script reuses that same infrastructure:
+nearest sampling point from sampling_points.csv, 100 m threshold, identical
+maths. No GeoJSON and no shapely, so it runs anywhere the MAVProxy files are.
 
-Columns: time, DO, temp, pressure, init_DO, init_pressure, batt_v, lat, lon
+Cache CSV columns (written by cache_sample_csv in main_rc8_uart_parm.py):
+    time, DO, temp, pressure, init_DO, init_pressure, batt_v, lat, lon
 
-Pond ID is resolved from lat/lon by point-in-polygon against the farm GeoJSON
-files, with a small buffer (same approach as cleanup_unknown_ponds.py).
+Record written matches the GCS winch record in mavproxy_haucs/__init__.py.
 
 Usage:
     python upload_cached_samples.py --dry-run
-    python upload_cached_samples.py
-    python upload_cached_samples.py --cache-dir /path/to/cache
-    python upload_cached_samples.py --type winch --drone-id SPLASHY_2
-    python upload_cached_samples.py --file cache/sample_20260811_024640_123.csv
     python upload_cached_samples.py --file 'cache/sample_20260810*.csv'
-    python upload_cached_samples.py --file 'cache/*0810*.csv' --pond BP2
-    python upload_cached_samples.py --file a.csv --file b.csv
+    python upload_cached_samples.py --file cache/sample_20260810*.csv
+    python upload_cached_samples.py --sampling-csv ../MAVProxy/sampling_points.csv
 
-Requires (same directory unless overridden):
+Setting the pond explicitly (needed for files with no reliable lat/lon, such
+as casts recovered from a log). Three ways, in priority order:
+
+    per file   --file 'recovered/a.csv=BP2' --file 'recovered/b.csv=BP3'
+    per glob   --file 'recovered/*.csv=BP2'
+    for all    --pond BP2 --file 'recovered/*.csv'
+
+Anything left unspecified falls back to the nearest sampling point. When every
+file has a pond, sampling_points.csv is not read at all.
+
+Needs alongside it (or pass paths):
     fb_key.json
-    farm_features.json
-    basler_features.json
+    sampling_points.csv      (from the GCS / MAVProxy directory)
 
-Dependencies:
-    pip install firebase-admin shapely pytz
+Dependencies: firebase-admin, pandas, numpy, pytz
 """
 
 import os
+import re
 import csv
 import glob
 import json
 import argparse
 from datetime import datetime
 
+import numpy as np
+import pandas as pd
 import pytz
 import firebase_admin
 from firebase_admin import credentials, db
-from shapely.geometry import shape, Point
 
 UTC_TZ = pytz.utc
-POLYGON_BUFFER_M = 8
+MATCH_THRESHOLD_M = 100      # same threshold as db_helper.get_pond_id
 METERS_PER_DEGREE = 111_000
 
+# The sensor reports init_do in raw counts (~4000) while the do samples are
+# already normalised ratios (~0.7-0.9). The GCS truck path hardcodes init_do=1
+# for exactly this reason. See firebase_worker.update_firebase:
+#     upload_data['init_do'] = 1  # hardcoded to handle legacy website
+# The winch path in __init__.py does NOT do this, which is why winch DO reads
+# as ~0.02 percent saturation on the website. We normalise here to match the
+# truck path, and keep the sensor's raw value under init_do_raw for reference.
+NORMALISE_INIT_DO = True
 
-# ---- Firebase login ------------------------------------------------
+
+# ---- Firebase ------------------------------------------------------
 
 def login(key_path='fb_key.json'):
     with open(key_path) as f:
@@ -60,47 +77,39 @@ def login(key_path='fb_key.json'):
     })
 
 
-# ---- Pond resolution from lat/lon ----------------------------------
+# ---- Pond lookup, mirroring db_helper.get_pond_id -------------------
 
-def load_pond_polygons(*geojson_paths):
-    buffer_deg = POLYGON_BUFFER_M / METERS_PER_DEGREE
-    polygons = []
-    for path in geojson_paths:
-        try:
-            with open(path) as f:
-                geo = json.load(f)
-        except FileNotFoundError:
-            print("  warning: %s not found, skipping" % path)
-            continue
-        for feature in geo.get('features', []):
-            pond_id = str(feature['properties']['number'])
-            poly = shape(feature['geometry']).buffer(buffer_deg)
-            polygons.append((pond_id, poly))
-    return polygons
+def load_sampling_points(path='sampling_points.csv'):
+    """
+    Returns (pond_ids, pond_gps) exactly as db_helper.get_pond_id builds them.
+    The CSV column order is pond, lon, lat -- note lon before lat.
+    """
+    df = pd.read_csv(path)
+    pond_ids = df.pop('pond').astype(str).to_numpy()
+    pond_gps = df.to_numpy()          # [[lon, lat], ...]
+    return pond_ids, pond_gps
 
 
-def match_pond(lat, lon, polygons):
-    point = Point(float(lon), float(lat))
-    for pond_id, poly in polygons:
-        if poly.contains(point):
-            return pond_id
-    return None
+def get_pond_id(lat, lng, pond_ids, pond_gps):
+    """Nearest sampling point within MATCH_THRESHOLD_M, else None."""
+    point = np.array([float(lng), float(lat)])
+    tiled = np.tile(point, (pond_gps.shape[0], 1))
+    distances = np.linalg.norm(pond_gps - tiled, axis=1)
+    min_dist_m = distances.min() * METERS_PER_DEGREE
+    if min_dist_m < MATCH_THRESHOLD_M:
+        return str(pond_ids[np.argmin(distances)]), min_dist_m
+    return None, min_dist_m
 
 
-# ---- Cache file parsing --------------------------------------------
+# ---- Cache parsing --------------------------------------------------
 
 def parse_cache_file(path):
-    """
-    Read one cache CSV and return a dict with the arrays and scalars,
-    or None if the file has no usable rows.
-    """
     with open(path, newline='') as f:
         rows = list(csv.DictReader(f))
-
     if not rows:
         return None
 
-    def col_float(name):
+    def col(name):
         out = []
         for r in rows:
             v = r.get(name, '')
@@ -111,146 +120,181 @@ def parse_cache_file(path):
                     pass
         return out
 
-    do_vals    = col_float('DO')
-    temp_vals  = col_float('temp')
-    press_vals = col_float('pressure')
-    init_do    = col_float('init_DO')
-    init_press = col_float('init_pressure')
-    battv      = col_float('batt_v')
-    lat_vals   = col_float('lat')
-    lon_vals   = col_float('lon')
-
+    do_vals = col('DO')
     if not do_vals:
         return None
 
+    press = col('pressure')
+    init_do_raw = col('init_DO')
+    init_p = col('init_pressure')
+    battv = col('batt_v')
+    lat = col('lat')
+    lon = col('lon')
+
     return {
         'do': do_vals,
-        'temp': temp_vals,
-        'pressure': press_vals,
-        'init_do': init_do[0] if init_do else 1,
-        'init_pressure': init_press[0] if init_press else (press_vals[0] if press_vals else 1013),
-        'sensor_battv': battv[0] if battv else None,
-        'lat': lat_vals[0] if lat_vals else None,
-        'lng': lon_vals[0] if lon_vals else None,
+        'temp': col('temp'),
+        'pressure': press,
+        'init_do_raw': init_do_raw[0] if init_do_raw else None,
+        'init_pressure': init_p[0] if init_p else (press[0] if press else 1013.0),
+        'batt_v': battv[0] if battv else None,
+        'lat': lat[0] if lat else None,
+        'lng': lon[0] if lon else None,
+        'n': len(rows),
     }
 
 
 def timestamp_from_filename(path, local_tz):
-    """
-    cache/sample_YYYYMMDD_HHMMSS_mmm.csv -> Firebase UTC key.
-    The filename timestamp is Pi local time; convert to UTC.
-    """
-    base = os.path.basename(path)
-    stem = base.replace('sample_', '').replace('.csv', '')
+    """sample_YYYYMMDD_HHMMSS_mmm.csv -> Firebase UTC key."""
+    stem = os.path.basename(path).replace('sample_', '').replace('.csv', '')
     parts = stem.split('_')
     if len(parts) < 2:
         return None
-    date_part, time_part = parts[0], parts[1]
     try:
-        naive = datetime.strptime(date_part + time_part, '%Y%m%d%H%M%S')
+        naive = datetime.strptime(parts[0] + parts[1], '%Y%m%d%H%M%S')
     except ValueError:
         return None
-    local = local_tz.localize(naive)
-    return local.astimezone(UTC_TZ).strftime('%Y%m%d_%H:%M:%S')
+    return local_tz.localize(naive).astimezone(UTC_TZ).strftime('%Y%m%d_%H:%M:%S')
+
+
+# ---- File selection -------------------------------------------------
+
+def split_pond_suffix(pattern):
+    """
+    Split an optional '=POND' suffix off a --file argument.
+
+    Recovered log CSVs and hand-made files often need their pond stated
+    explicitly, and a batch can span several ponds, so the pond travels with
+    the path rather than being one global flag:
+
+        --file 'recovered/a.csv=BP2' --file 'recovered/b.csv=BP3'
+        --file 'recovered/*.csv=BP2'
+
+    '=' is used rather than ':' so Windows drive letters (D: drive paths) are safe.
+    Only the last '=' is considered, and only when what follows contains no
+    path separator, so a filename that legitimately contains '=' still works.
+    """
+    if '=' not in pattern:
+        return pattern, None
+    head, tail = pattern.rsplit('=', 1)
+    tail = tail.strip()
+    if not head or not tail:
+        return pattern, None
+    # A pond id is a short bare token: letters, digits, underscore. Anything
+    # containing a path separator or a dot is part of the filename, so a file
+    # legitimately named 'weird=name.csv' is left alone.
+    if not re.match(r'^[A-Za-z0-9_]+$', tail):
+        return pattern, None
+    return head, tail
 
 
 def collect_files(args):
     """
-    Resolve --file into a sorted, de-duplicated list of CSV paths.
+    Resolve --file into a sorted, de-duplicated list of (path, pond) pairs,
+    where pond is a per-file override or None.
 
-    Accepts any mix of:
-      - a plain path            --file cache/sample_20260810_024640_123.csv
-      - a glob                  --file 'cache/sample_20260810*.csv'
-      - repeated flags          --file a.csv --file b.csv
-      - a shell-expanded list   --file cache/sample_20260810*.csv   (unquoted)
-
-    The unquoted form is expanded by the shell before Python sees it, so only
-    the first path reaches --file and the rest arrive as stray positionals.
-    Those are captured by 'extra' and folded back in here, which makes both
-    the quoted and unquoted forms behave the same way.
-
-    With no --file at all, falls back to every sample_*.csv in --cache-dir.
+    Handles a plain path, a glob, repeated flags, a directory, and the
+    shell-pre-expanded form where extra paths arrive as positionals.
     """
     patterns = list(args.file or [])
     patterns += list(getattr(args, 'extra', None) or [])
 
     if not patterns:
-        return sorted(glob.glob(os.path.join(args.cache_dir, 'sample_*.csv')))
+        return [(f, None) for f in
+                sorted(glob.glob(os.path.join(args.cache_dir, 'sample_*.csv')))]
 
     out = []
-    for pat in patterns:
+    for raw in patterns:
+        pat, pond = split_pond_suffix(raw)
         if any(ch in pat for ch in '*?['):
             hits = sorted(glob.glob(pat))
             if not hits:
                 print("  warning: no match for %s" % pat)
-            out.extend(hits)
+            out.extend((h, pond) for h in hits)
         elif os.path.isdir(pat):
-            out.extend(sorted(glob.glob(os.path.join(pat, 'sample_*.csv'))))
+            out.extend((h, pond) for h in
+                       sorted(glob.glob(os.path.join(pat, 'sample_*.csv'))))
         elif os.path.exists(pat):
-            out.append(pat)
+            out.append((pat, pond))
         else:
             print("  warning: not found %s" % pat)
 
-    # de-duplicate while keeping order stable
-    seen = set()
-    uniq = []
-    for f in out:
+    # De-duplicate by absolute path. A later explicit pond wins over an
+    # earlier one so a glob can set a default and a specific file refine it.
+    seen = {}
+    for f, pond in out:
         real = os.path.abspath(f)
-        if real not in seen:
-            seen.add(real)
-            uniq.append(f)
-    return sorted(uniq)
+        if real not in seen or pond is not None:
+            seen[real] = (f, pond)
+    return sorted(seen.values(), key=lambda x: x[0])
 
 
 # ---- Main -----------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Upload cached Pi sample CSVs directly to Firebase")
-    parser.add_argument('--cache-dir', default='cache',
-                        help="Directory holding sample_*.csv (default: cache)")
-    parser.add_argument('--file', action='append', default=None,
-                        metavar='PATH_OR_GLOB',
-                        help="Specific CSV, or a glob such as "
-                             "'cache/sample_20260810*.csv'. Repeatable. "
-                             "Quote the pattern so the shell does not expand it "
-                             "(harmless either way, both forms work).")
-    parser.add_argument('--type', default='winch',
-                        help="Value for the record 'type' field (default: winch)")
-    parser.add_argument('--drone-id', default=None,
-                        help="Optional drone_id to store on each record")
-    parser.add_argument('--tz', default='America/Chicago',
-                        help="Timezone of the Pi filenames (default: America/Chicago)")
-    parser.add_argument('--lh-geojson', default='farm_features.json')
-    parser.add_argument('--basler-geojson', default='basler_features.json')
-    parser.add_argument('--pond', default=None,
-                        help="Force a pond ID instead of resolving from lat/lon")
-    parser.add_argument('--overwrite', action='store_true',
-                        help="Overwrite if a record already exists at that key")
-    parser.add_argument('--dry-run', action='store_true',
-                        help="Show what would be uploaded without writing")
-    parser.add_argument('extra', nargs='*',
-                        help="Extra CSV paths. Mostly these arrive automatically "
-                             "when an unquoted glob is expanded by the shell.")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Upload cached Pi sample CSVs to Firebase, bypassing the encoder")
+    ap.add_argument('--cache-dir', default='cache',
+                    help="Directory of sample_*.csv (default: cache)")
+    ap.add_argument('--file', action='append', default=None,
+                    metavar='PATH[=POND]',
+                    help="Specific CSV or glob, e.g. 'cache/sample_20260810*.csv'. "
+                         "Repeatable. Append '=POND' to set the pond for that "
+                         "file or glob, e.g. 'recovered/a.csv=BP2'. Overrides "
+                         "--pond and the lat/lon lookup for those files.")
+    ap.add_argument('--sampling-csv', default='sampling_points.csv',
+                    help="MAVProxy sampling_points.csv used for pond lookup")
+    ap.add_argument('--pond', default=None,
+                    help="Force a pond ID for every file that has no '=POND' "
+                         "suffix, instead of resolving from lat/lon")
+    ap.add_argument('--drone-id', default='SPLASHY_UNK',
+                    help="Value for the record sid field (default: SPLASHY_UNK)")
+    ap.add_argument('--type', default='winch',
+                    help="Value for the record type field (default: winch)")
+    ap.add_argument('--tz', default='America/Chicago',
+                    help="Timezone of the Pi filenames (default: America/Chicago)")
+    ap.add_argument('--raw-init-do', action='store_true',
+                    help="Write the sensor's raw init_do instead of normalising to 1. "
+                         "Only use this if the sensor firmware is changed so that "
+                         "do samples and init_do share the same units.")
+    ap.add_argument('--overwrite', action='store_true',
+                    help="Replace an existing record at the same key")
+    ap.add_argument('--dry-run', action='store_true',
+                    help="Show what would be uploaded without writing")
+    ap.add_argument('extra', nargs='*',
+                    help="Extra CSV paths, usually from an unquoted shell glob")
+    args = ap.parse_args()
 
     local_tz = pytz.timezone(args.tz)
-
     files = collect_files(args)
-
     if not files:
         print("No cache files matched.")
         return
 
-    print("Found %d cache file(s)\n" % len(files))
+    print("Found %d cache file(s)" % len(files))
 
-    login()
-    polygons = load_pond_polygons(args.lh_geojson, args.basler_geojson)
-    print("Loaded %d pond polygon(s)\n" % len(polygons))
+    # The sampling point table is only needed for files whose pond is not
+    # already known, so a fully specified batch can run without it.
+    needs_lookup = any(pond is None for _, pond in files) and not args.pond
+
+    pond_ids = pond_gps = None
+    if needs_lookup:
+        if not os.path.exists(args.sampling_csv):
+            print("\nERROR: %s not found." % args.sampling_csv)
+            print("Pond lookup lives on the GCS. Either copy sampling_points.csv")
+            print("from the MAVProxy directory, point at it with --sampling-csv,")
+            print("or bypass the lookup entirely with --pond BP2.")
+            return
+        pond_ids, pond_gps = load_sampling_points(args.sampling_csv)
+        print("Loaded %d sampling point(s) from %s" % (len(pond_ids), args.sampling_csv))
+    print()
+
+    if not args.dry_run:
+        login()
 
     n_ok = n_skip = 0
 
-    for path in files:
+    for path, pond_override in files:
         name = os.path.basename(path)
         parsed = parse_cache_file(path)
         if parsed is None:
@@ -264,71 +308,77 @@ def main():
             n_skip += 1
             continue
 
-        # Resolve pond
-        if args.pond:
-            pond_id = args.pond
-        elif parsed['lat'] is not None and parsed['lng'] is not None:
-            pond_id = match_pond(parsed['lat'], parsed['lng'], polygons)
+        # Resolve pond: per-file override, then --pond, then lat/lon lookup
+        if pond_override:
+            pond_id, dist, how = pond_override, None, 'from --file'
+        elif args.pond:
+            pond_id, dist, how = args.pond, None, 'from --pond'
+        elif pond_ids is not None and parsed['lat'] is not None and parsed['lng'] is not None:
+            pond_id, dist = get_pond_id(parsed['lat'], parsed['lng'], pond_ids, pond_gps)
+            how = 'from lat/lon %.0f m' % dist if dist is not None else 'from lat/lon'
         else:
-            pond_id = None
+            pond_id, dist, how = None, None, 'unresolved'
 
         if pond_id is None:
-            print("%s: no pond match (lat=%s lng=%s), skipping. Use --pond to force."
-                  % (name, parsed['lat'], parsed['lng']))
+            msg = "no pond within %d m" % MATCH_THRESHOLD_M
+            if dist is not None:
+                msg += " (nearest %.0f m)" % dist
+            print("%s: %s, skipping. Use --pond to force." % (name, msg))
             n_skip += 1
             continue
 
-        pond_key = 'pond_%s' % pond_id
+        # init_do normalisation -- see the note at the top of this file
+        raw_init = parsed['init_do_raw']
+        init_do = raw_init if args.raw_init_do else 1
 
-        # Build the Firebase record in the same shape the web app expects
         record = {
             'do': parsed['do'],
             'temp': parsed['temp'],
             'pressure': parsed['pressure'],
-            'init_do': parsed['init_do'],
+            'init_do': init_do,
             'init_pressure': parsed['init_pressure'],
-            'pid': pond_id,
+            'pid': str(pond_id),
+            'sid': args.drone_id,
             'type': args.type,
+            'seq': 0,
         }
+        if raw_init is not None:
+            record['init_do_raw'] = raw_init
         if parsed['lat'] is not None:
             record['lat'] = parsed['lat']
         if parsed['lng'] is not None:
             record['lng'] = parsed['lng']
-        if parsed['sensor_battv'] is not None:
-            record['sensor_battv'] = parsed['sensor_battv']
-        if args.drone_id:
-            record['drone_id'] = args.drone_id
+        if parsed['batt_v'] is not None:
+            record['batt_v'] = parsed['batt_v']
 
-        # Depth range as a sanity readout
-        if parsed['pressure']:
-            span = max(parsed['pressure']) - min(parsed['pressure'])
-            depth_in = span * 10.197 / 25.4
-        else:
-            depth_in = 0
+        press = parsed['pressure']
+        span = (max(press) - min(press)) if press else 0.0
+        depth_in = span * 10.197 / 25.4
+        do_lo, do_hi = min(parsed['do']), max(parsed['do'])
 
         print("%s" % name)
-        print("    -> LH_Farm/%s/%s" % (pond_key, ts_key))
-        print("       n=%d  init_do=%s  init_p=%s  depth_span=%.1f in (%.2f ft)"
-              % (len(parsed['do']), parsed['init_do'],
-                 parsed['init_pressure'], depth_in, depth_in / 12))
+        print("    -> LH_Farm/pond_%s/%s   (%s)" % (pond_id, ts_key, how))
+        print("       n=%d  depth span %.1f in (%.2f ft)  DO %.2f..%.2f"
+              % (parsed['n'], depth_in, depth_in / 12, do_lo, do_hi))
+        print("       init_do=%s (raw %s)  init_pressure=%.2f"
+              % (init_do, raw_init, parsed['init_pressure']))
 
         if args.dry_run:
             n_ok += 1
             continue
 
-        ref = db.reference('LH_Farm/%s/%s' % (pond_key, ts_key))
+        ref = db.reference('LH_Farm/pond_%s/%s' % (pond_id, ts_key))
         if ref.get() and not args.overwrite:
-            print("       record already exists, skipping (use --overwrite)")
+            print("       record exists, skipping (use --overwrite)")
             n_skip += 1
             continue
 
         ref.set(record)
         n_ok += 1
 
-    print("")
+    print()
     if args.dry_run:
-        print("DRY RUN. %d would upload, %d skipped. Re-run without --dry-run to apply."
-              % (n_ok, n_skip))
+        print("DRY RUN. %d would upload, %d skipped." % (n_ok, n_skip))
     else:
         print("Done. %d uploaded, %d skipped." % (n_ok, n_skip))
 
