@@ -82,7 +82,7 @@ wParms = {
     "HALL_MIN": 2500,
     "HALL_MAX": 12285,
     "HALL_TARGET": 2500,
-    "RETRACT_PWR": 0.15,
+    "RETRACT_PWR": 0.1,
     "RELEASE_PWR": -0.40,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
