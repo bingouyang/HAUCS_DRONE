@@ -19,6 +19,9 @@ Usage:
     python upload_cached_samples.py --cache-dir /path/to/cache
     python upload_cached_samples.py --type winch --drone-id SPLASHY_2
     python upload_cached_samples.py --file cache/sample_20260811_024640_123.csv
+    python upload_cached_samples.py --file 'cache/sample_20260810*.csv'
+    python upload_cached_samples.py --file 'cache/*0810*.csv' --pond BP2
+    python upload_cached_samples.py --file a.csv --file b.csv
 
 Requires (same directory unless overridden):
     fb_key.json
@@ -151,6 +154,54 @@ def timestamp_from_filename(path, local_tz):
     return local.astimezone(UTC_TZ).strftime('%Y%m%d_%H:%M:%S')
 
 
+def collect_files(args):
+    """
+    Resolve --file into a sorted, de-duplicated list of CSV paths.
+
+    Accepts any mix of:
+      - a plain path            --file cache/sample_20260810_024640_123.csv
+      - a glob                  --file 'cache/sample_20260810*.csv'
+      - repeated flags          --file a.csv --file b.csv
+      - a shell-expanded list   --file cache/sample_20260810*.csv   (unquoted)
+
+    The unquoted form is expanded by the shell before Python sees it, so only
+    the first path reaches --file and the rest arrive as stray positionals.
+    Those are captured by 'extra' and folded back in here, which makes both
+    the quoted and unquoted forms behave the same way.
+
+    With no --file at all, falls back to every sample_*.csv in --cache-dir.
+    """
+    patterns = list(args.file or [])
+    patterns += list(getattr(args, 'extra', None) or [])
+
+    if not patterns:
+        return sorted(glob.glob(os.path.join(args.cache_dir, 'sample_*.csv')))
+
+    out = []
+    for pat in patterns:
+        if any(ch in pat for ch in '*?['):
+            hits = sorted(glob.glob(pat))
+            if not hits:
+                print("  warning: no match for %s" % pat)
+            out.extend(hits)
+        elif os.path.isdir(pat):
+            out.extend(sorted(glob.glob(os.path.join(pat, 'sample_*.csv'))))
+        elif os.path.exists(pat):
+            out.append(pat)
+        else:
+            print("  warning: not found %s" % pat)
+
+    # de-duplicate while keeping order stable
+    seen = set()
+    uniq = []
+    for f in out:
+        real = os.path.abspath(f)
+        if real not in seen:
+            seen.add(real)
+            uniq.append(f)
+    return sorted(uniq)
+
+
 # ---- Main -----------------------------------------------------------
 
 def main():
@@ -158,8 +209,12 @@ def main():
         description="Upload cached Pi sample CSVs directly to Firebase")
     parser.add_argument('--cache-dir', default='cache',
                         help="Directory holding sample_*.csv (default: cache)")
-    parser.add_argument('--file', default=None,
-                        help="Upload a single specific CSV instead of the whole dir")
+    parser.add_argument('--file', action='append', default=None,
+                        metavar='PATH_OR_GLOB',
+                        help="Specific CSV, or a glob such as "
+                             "'cache/sample_20260810*.csv'. Repeatable. "
+                             "Quote the pattern so the shell does not expand it "
+                             "(harmless either way, both forms work).")
     parser.add_argument('--type', default='winch',
                         help="Value for the record 'type' field (default: winch)")
     parser.add_argument('--drone-id', default=None,
@@ -174,17 +229,17 @@ def main():
                         help="Overwrite if a record already exists at that key")
     parser.add_argument('--dry-run', action='store_true',
                         help="Show what would be uploaded without writing")
+    parser.add_argument('extra', nargs='*',
+                        help="Extra CSV paths. Mostly these arrive automatically "
+                             "when an unquoted glob is expanded by the shell.")
     args = parser.parse_args()
 
     local_tz = pytz.timezone(args.tz)
 
-    if args.file:
-        files = [args.file]
-    else:
-        files = sorted(glob.glob(os.path.join(args.cache_dir, 'sample_*.csv')))
+    files = collect_files(args)
 
     if not files:
-        print("No cache files found.")
+        print("No cache files matched.")
         return
 
     print("Found %d cache file(s)\n" % len(files))
