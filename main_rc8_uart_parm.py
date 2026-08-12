@@ -327,18 +327,51 @@ def release_win(servo, adc, cfg, st, stop_evt):
     #   - Mid-check: if sensor goes DOWN during release, motor is running backwards
 
     # --- Pre-release Hall sensor sanity check ---
+    RECOVERY_SEC = 10.0
     try:
-        hall_start = hall_raw(adc)
+        hall_start = hall_median(adc)
         if hall_start > cfg["RETRACT_TH"]:
-            logger.info("SAFETY ABORT: Hall sensor reads %d before release "
-                        "(expected near %d). Possible polarity reversal or "
-                        "winch already deployed. Aborting release." %
-                        (hall_start, cfg["HALL_TARGET"]))
+            # Line still out. This is recoverable: pull it in, then release.
+            # Aborting used to strand the winch, since nothing else retracts it,
+            # so every later cast hit the same check and the session produced
+            # flat surface-only profiles.
+            logger.info("Hall reads %d before release (expected near %d). Line "
+                        "appears still out - attempting recovery retract, up to %.0fs."
+                        % (hall_start, cfg["HALL_TARGET"], RECOVERY_SEC))
+
+            retract_adaptive._hall_start = None      # fresh polarity baseline
+            st["RETRACTED"] = 0                      # it is out, record that
+            rvalue = -cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"] + cfg["NEUTRAL_POS"]
+            servo.value = float(rvalue)
+
+            t_rec = time.time()
+            recovered = False
+            while not stop_evt.is_set() and (time.time() - t_rec) < RECOVERY_SEC:
+                if retract_adaptive(servo, adc, cfg, st):
+                    recovered = True
+                    break
+                time.sleep(0.02)
+
             neutral(servo, cfg)
-            return
-        logger.info("Hall pre-check OK: %d (threshold %d)" % (hall_start, cfg["RETRACT_TH"]))
+            hall_start = hall_median(adc)
+
+            if not recovered and hall_start > cfg["RETRACT_TH"]:
+                logger.info("SAFETY ABORT: recovery retract did not clear in %.0fs "
+                            "(hall still %d). Aborting release."
+                            % (RECOVERY_SEC, hall_start))
+                # Leave RETRACTED at 0 so the next cycle retries recovery
+                # instead of assuming the line is already in.
+                st["RETRACTED"] = 0
+                st["last_abort"] = "recovery_failed"
+                return
+
+            logger.info("Recovery retract OK: hall now %d, proceeding with release."
+                        % hall_start)
+        else:
+            logger.info("Hall pre-check OK: %d (threshold %d)"
+                        % (hall_start, cfg["RETRACT_TH"]))
     except Exception as e:
-        logger.info("Hall pre-check failed: %s — proceeding with release" % e)
+        logger.info("Hall pre-check failed: %s - proceeding with release" % e)
         hall_start = None
 
     svalue = cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
@@ -358,7 +391,7 @@ def release_win(servo, adc, cfg, st, stop_evt):
                 hall_now = hall_raw(adc)
                 if hall_now < (hall_start - cfg["RETRACT_SETTLE"]):
                     logger.info("SAFETY ABORT: Hall sensor decreased during release "
-                                "(%d -> %d). Motor running backwards — possible "
+                                "(%d -> %d). Motor running backwards - possible "
                                 "polarity reversal. Aborting release." %
                                 (hall_start, hall_now))
                     neutral(servo, cfg)
@@ -371,6 +404,26 @@ def release_win(servo, adc, cfg, st, stop_evt):
     st["RETRACTED"] = 0  # mark as extended after descent completes
     neutral(servo, cfg)
 
+def hall_median(adc, n=3, gap=0.02):
+    """
+    Median of n reads. The pre-check acts on one sample, so a single bad read
+    would either abort a good cast or trigger recovery that is not needed.
+    n=3 rejects a lone outlier without masking real motion.
+    """
+    vals = []
+    for i in range(n):
+        try:
+            vals.append(hall_raw(adc))
+        except Exception:
+            pass
+        if i < n - 1:
+            time.sleep(gap)
+    if not vals:
+        raise RuntimeError("no hall readings")
+    vals.sort()
+    return vals[len(vals) // 2]
+
+
 def retract_adaptive(servo, adc, cfg, st):
     try:
         hall_now = hall_raw(adc)
@@ -378,7 +431,7 @@ def retract_adaptive(servo, adc, cfg, st):
 
         # --- Retract polarity safeguard ---
         # During retract the Hall reading should decrease toward HALL_TARGET.
-        # If it is already near HALL_TARGET or below, something is wrong —
+        # If it is already near HALL_TARGET or below, something is wrong -
         # either polarity is reversed (motor extending instead of retracting)
         # or the sensor is reading incorrectly. Stop immediately.
         hall_start = getattr(retract_adaptive, "_hall_start", None)
@@ -386,7 +439,7 @@ def retract_adaptive(servo, adc, cfg, st):
             retract_adaptive._hall_start = hall_now
         elif hall_now > hall_start + cfg["RETRACT_SETTLE"]:
             logger.info("SAFETY ABORT: Hall sensor increased during retract "
-                        "(%d -> %d). Motor running backwards — possible "
+                        "(%d -> %d). Motor running backwards - possible "
                         "polarity reversal. Aborting retract." %
                         (hall_start, hall_now))
             neutral(servo, cfg)
