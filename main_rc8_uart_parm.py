@@ -88,6 +88,12 @@ wParms = {
     "ROTATION_DIRECTION": -1,
     "RELEASE_SEC": 20,      # 071426: motor drives payload down; overridden by SCR_USER1
     "RETRACT_SETTLE": 50,
+    # 081226: reverse detection needs its own band. RETRACT_SETTLE=50 is a
+    # position tolerance for "we are home"; reusing it as the polarity trip
+    # made the abort fire on the motor-energize transient, which measured
+    # about +420 counts in the 2026-08-12 19:07 log.
+    "HALL_REVERSE_TH": 800,
+    "HALL_REVERSE_GRACE": 0.6,   # seconds after energizing before checking
     "RETRACT_TH": 8000,
     "PWD_ADP_TH": 10000,
     "LOG_PREFIX": "[WINCH] ",
@@ -339,9 +345,14 @@ def release_win(servo, adc, cfg, st, stop_evt):
                         "appears still out - attempting recovery retract, up to %.0fs."
                         % (hall_start, cfg["HALL_TARGET"], RECOVERY_SEC))
 
-            retract_adaptive._hall_start = None      # fresh polarity baseline
+            reset_retract_state()                    # fresh polarity baseline
             st["RETRACTED"] = 0                      # it is out, record that
-            rvalue = -cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"] + cfg["NEUTRAL_POS"]
+            # 081226: sign was inverted here. Every other retract site uses
+            # +ROTATION_DIRECTION * RETRACT_PWR (line 573, line 485). The
+            # leading minus drove the servo to +0.1 instead of -0.1, so the
+            # recovery "retract" paid line OUT. The Hall reading rose
+            # (11239 -> 11468) and the polarity safeguard correctly aborted.
+            rvalue = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"] + cfg["NEUTRAL_POS"]
             servo.value = float(rvalue)
 
             t_rec = time.time()
@@ -349,6 +360,14 @@ def release_win(servo, adc, cfg, st, stop_evt):
             while not stop_evt.is_set() and (time.time() - t_rec) < RECOVERY_SEC:
                 if retract_adaptive(servo, adc, cfg, st):
                     recovered = True
+                    break
+                # 081226: bail out immediately on a real abort. Previously the
+                # loop kept spinning at neutral for the full RECOVERY_SEC
+                # because retract_adaptive only commands power when the servo
+                # is already energized, so it could never restart itself.
+                if retract_adaptive._state["aborted"]:
+                    logger.info("Recovery retract aborted by polarity safeguard, "
+                                "stopping early.")
                     break
                 time.sleep(0.02)
 
@@ -424,26 +443,52 @@ def hall_median(adc, n=3, gap=0.02):
     return vals[len(vals) // 2]
 
 
+def reset_retract_state():
+    """
+    081226: dict-based state tracker. Do not go back to the
+    hasattr/_hall_start=None pattern - it raises TypeError on the second
+    retract cycle, which the bare except in retract_adaptive swallows,
+    sending the servo straight to neutral.
+    """
+    if not hasattr(retract_adaptive, "_state"):
+        retract_adaptive._state = {"hall_start": None, "t_start": None,
+                                   "aborted": False}
+    retract_adaptive._state["hall_start"] = None
+    retract_adaptive._state["t_start"] = None
+    retract_adaptive._state["aborted"] = False
+
+
 def retract_adaptive(servo, adc, cfg, st):
+    if not hasattr(retract_adaptive, "_state"):
+        retract_adaptive._state = {"hall_start": None, "t_start": None,
+                                   "aborted": False}
+    stt = retract_adaptive._state
+
     try:
         hall_now = hall_raw(adc)
         dist = hall_now - cfg["HALL_TARGET"]
 
         # --- Retract polarity safeguard ---
         # During retract the Hall reading should decrease toward HALL_TARGET.
-        # If it is already near HALL_TARGET or below, something is wrong -
-        # either polarity is reversed (motor extending instead of retracting)
-        # or the sensor is reading incorrectly. Stop immediately.
-        hall_start = getattr(retract_adaptive, "_hall_start", None)
-        if hall_start is None:
-            retract_adaptive._hall_start = hall_now
-        elif hall_now > hall_start + cfg["RETRACT_SETTLE"]:
+        # A sustained INCREASE means the motor is paying line out instead of
+        # pulling it in.
+        # 081226: two changes. The trip band is now HALL_REVERSE_TH rather
+        # than RETRACT_SETTLE, and the check is suppressed for
+        # HALL_REVERSE_GRACE seconds after the baseline is taken, because
+        # energizing the motor shifts the reading by several hundred counts
+        # before any line moves.
+        if stt["hall_start"] is None:
+            stt["hall_start"] = hall_now
+            stt["t_start"] = time.time()
+        elif (time.time() - stt["t_start"]) > cfg["HALL_REVERSE_GRACE"] and \
+                hall_now > stt["hall_start"] + cfg["HALL_REVERSE_TH"]:
             logger.info("SAFETY ABORT: Hall sensor increased during retract "
-                        "(%d -> %d). Motor running backwards - possible "
-                        "polarity reversal. Aborting retract." %
-                        (hall_start, hall_now))
+                        "(%d -> %d, band %d). Motor running backwards - "
+                        "possible polarity reversal. Aborting retract." %
+                        (stt["hall_start"], hall_now, cfg["HALL_REVERSE_TH"]))
             neutral(servo, cfg)
-            retract_adaptive._hall_start = None
+            stt["hall_start"] = None
+            stt["aborted"] = True
             return False
 
     except Exception:
@@ -471,7 +516,7 @@ def retract_adaptive(servo, adc, cfg, st):
     if dist < cfg["RETRACT_SETTLE"]:
         if st["RETRACTED"] != 1:
             st["RETRACTED"] = 1
-            retract_adaptive._hall_start = None  # reset for next cycle
+            stt["hall_start"] = None  # reset for next cycle
             fsm_st["deploy_allowed"] = True
             logger.info("Deploy re-enabled (fully retracted)")
             if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
@@ -481,7 +526,14 @@ def retract_adaptive(servo, adc, cfg, st):
         if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
             neutral(servo, cfg)
 
-    elif (dist < cfg["PWD_ADP_TH"]) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0):
+    elif dist < cfg["PWD_ADP_TH"]:
+        # 081226: the old guard here was
+        #   and ((ROTATION_DIRECTION * servo.value) > 0.0)
+        # which meant this function could only modulate a servo that was
+        # already moving. Once anything called neutral() mid-retract, the
+        # drive loop spun uselessly until its timeout. retract_adaptive is
+        # only ever called from inside a retract loop, so commanding
+        # unconditionally is the correct behaviour.
         servo.value = cfg["ROTATION_DIRECTION"] * pwr + cfg["NEUTRAL_POS"]
         logger.info("currnt adaptive pwr: %s" % servo.value)
 
@@ -569,8 +621,11 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     logger.info("RETRACT for %ss" % dur)
                     t0 = time.time()
                     # Start each retract with a fresh Hall-direction baseline.
-                    retract_adaptive._hall_start = None
-                    servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"]
+                    reset_retract_state()
+                    # 081226: NEUTRAL_POS was missing here but present at every
+                    # other drive site. Harmless while NEUTRAL_POS is 0.0, wrong
+                    # the moment it is trimmed.
+                    servo.value = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"] + cfg["NEUTRAL_POS"]
                     logger.info("servo.value %s" % servo.value)
                     time.sleep(0.25)
 
@@ -579,10 +634,13 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                         if retract_flag is True:
                             logger.info("Fully retractd!")
                             break
+                        if retract_adaptive._state["aborted"]:
+                            logger.info("Retract aborted by polarity safeguard, stopping early.")
+                            break
                         time.sleep(0.1)
                     if (time.time() - t0) >= dur:
                         logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
-                    retract_adaptive._hall_start = None
+                    reset_retract_state()
                     neutral(servo, cfg)
 
                 elif act == "NEUTRAL":
