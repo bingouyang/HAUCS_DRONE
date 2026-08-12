@@ -12,20 +12,57 @@ HEARTBEAT_RATE=1.0
 # payload and header for encoding
 DATA_BYTES = 96
 HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
-MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
-SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower).
+# MAX_SAMPLES is per-variable now; see max_samples(var_id) below.
+# ---- Residue coding, MUST match the other side exactly -------------------
+#
+# Each frame carries: var_base (int16) + N residues, where
+#     residue = round((value - var_base) * SCALE_MAP[var_id])
+# and var_base = round(mean of the chunk).
+#
+# Two things bound the scale:
+#   1. the residue must fit its integer width
+#   2. var_base is rounded to an integer, which alone costs up to 0.5
+#
+# Worst-case |value - var_base| measured over 8 real casts (BP2, Aug 2026):
+#     DO        0.41 ratio      temp   2.07 C
+#     pressure  64.1 hPa        batt   0.22 V
+# Scales below keep at least 2x margin on those figures.
+#
+# Pressure is the exception: 64 hPa of spread against an int8 limit of 127
+# caps it at scale 1, i.e. 1 hPa = 0.40 in of depth. That is adequate at a
+# fast ascent but becomes coarser than the sample spacing once the winch is
+# slowed to resolve near-bottom structure. It therefore uses int16 residues,
+# which costs one extra frame per cast and lifts the safe scale to ~255.
 
-# Per-variable scale factors — must match SCALE_MAP in sampling_helper.py exactly.
-# Pressure spans ~90 hPa which overflows int8 at SCALE=32 (max +-4 hPa from base).
+SCALE = 32          # fallback for any var_id not listed
+
 SCALE_MAP = {
-    0: 1,    # time          -- integer seconds, +-127s range from base
-    1: 32,   # DO
-    2: 32,   # temp
-    3: 1,    # pressure       -- 1 hPa resolution, +-127 hPa range from base
-    4: 32,   # init_DO
-    5: 1,    # init_pressure
-    6: 32,   # batt_v
+    0: 1,      # time           sample index, integer
+    1: 100,    # DO             0.01 ratio, matches the sensor's own 2 dp
+    2: 32,     # temp           0.031 C; 64 would clip on observed 2.07 C spread
+    3: 100,    # pressure       0.01 hPa = 0.004 in   (int16, see WIDTH_MAP)
+    4: 32,     # init_DO        constant per cast, base captures it
+    5: 100,    # init_pressure  0.01 hPa; scale 1 was discarding the decimals
+    6: 100,    # batt_v         0.01 V
 }
+
+# Residue width in bytes. Anything not listed is 1 (int8).
+WIDTH_MAP = {
+    3: 2,      # pressure needs int16
+}
+
+def residue_width(var_id):
+    return WIDTH_MAP.get(int(var_id), 1)
+
+def residue_fmt(var_id):
+    return "h" if residue_width(var_id) == 2 else "b"
+
+def residue_limits(var_id):
+    return (-32768, 32767) if residue_width(var_id) == 2 else (-128, 127)
+
+def max_samples(var_id):
+    return (DATA_BYTES - HDR_LEN) // residue_width(var_id)
+
 # set or read the two high bits in var_len (payload[7])
 FLAG_NONE = 0
 FLAG_EOF  = 1  # end of frame
@@ -76,25 +113,37 @@ def chunker(values, n):
 
 def build_frames(values, var_id, start_seq, is_resend=False):
     seq = start_seq
-    scale = SCALE_MAP.get(int(var_id), SCALE)  # per-variable scale
+    scale = SCALE_MAP.get(int(var_id), SCALE)
+    fmt = residue_fmt(var_id)
+    lo, hi = residue_limits(var_id)
+    n_max = max_samples(var_id)
 
     if not values:
         return
 
-    for chunk in chunker(values, MAX_SAMPLES):
+    for chunk in chunker(values, n_max):
         if not chunk:
             continue
 
         var_base = int(round(sum(chunk) / len(chunk)))
         residues = []
+        clipped = 0
 
         for v in chunk:
             r = int(round((v - var_base) * scale))
-            if r < -128:
-                r = -128
-            if r > 127:
-                r = 127
+            if r < lo:
+                r = lo
+                clipped += 1
+            if r > hi:
+                r = hi
+                clipped += 1
             residues.append(r)
+
+        if clipped:
+            # Silent clipping is how the old flat SCALE=32 destroyed pressure
+            # casts, so make it visible rather than letting it pass.
+            print("WARN encoder: var %d clipped %d of %d residues at scale %d"
+                  % (var_id, clipped, len(residues), scale))
 
         var_len = len(residues)
         var_byte = (int(var_id) & 0x7F) | (0x80 if is_resend else 0)
@@ -107,13 +156,14 @@ def build_frames(values, var_id, start_seq, is_resend=False):
             var_len & 0xFF,
         )
 
-        payload = bytearray(header + struct.pack("!" + "b" * var_len, *residues))
+        payload = bytearray(header + struct.pack("!" + fmt * var_len, *residues))
 
         if len(payload) < DATA_BYTES:
             payload.extend(b"\x00" * (DATA_BYTES - len(payload)))
 
         yield seq, payload
         seq = (seq + 1) & 0xFFFFFFFF
+
 '''
 def build_frames(values, var_id, start_seq):
     seq = start_seq
