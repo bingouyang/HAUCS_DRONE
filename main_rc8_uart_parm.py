@@ -81,13 +81,28 @@ wParms = {
     "ADC_PIN": 0,
     "HALL_MIN": 2500,
     "HALL_MAX": 12285,
-    "HALL_TARGET": 2500,
+    # 081226: measured stop. Under continuous retract the reading pins at
+    # 2662 (min 2644, max 2682, stdev 6.7) and drifts +17 counts over 58s,
+    # i.e. it is hard against the stop, not creeping in. The old settle line
+    # of 2550 sat below that floor, so retract could never succeed and every
+    # cycle timed out and blocked deploy. Settle line is now 2800, 118 clear
+    # of the observed max 2682. RETRACT_SETTLE is left at 50 on purpose - it
+    # is also the band for both polarity checks, so widening it there would
+    # have quietly changed two unrelated safeguards.
+    "HALL_TARGET": 2750,
     "RETRACT_PWR": 0.1,
     "RELEASE_PWR": -0.40,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
     "RELEASE_SEC": 20,      # 071426: motor drives payload down; overridden by SCR_USER1
     "RETRACT_SETTLE": 50,
+    # 081226: no-progress detector. If the line jams, the old code drove into
+    # it for the full RETRACT_SEC (60s in the 21:43 log). Stop after 5s of no
+    # movement instead: close to target means the goal is met, far from it
+    # means something is stuck and grinding will not help.
+    "RETRACT_STALL_SEC": 5.0,     # seconds of no progress before deciding
+    "RETRACT_PROGRESS": 30,       # counts of inward movement that count as progress
+    "RETRACT_STALL_CLOSE": 500,   # within this of target, a stall means "done"
     "RETRACT_TH": 8000,
     "PWD_ADP_TH": 10000,
     "LOG_PREFIX": "[WINCH] ",
@@ -427,6 +442,7 @@ def hall_median(adc, n=3, gap=0.02):
 def retract_adaptive(servo, adc, cfg, st):
     try:
         hall_now = hall_raw(adc)
+        retract_adaptive._last_hall = hall_now   # 081226: for the stall check
         dist = hall_now - cfg["HALL_TARGET"]
 
         # --- Retract polarity safeguard ---
@@ -574,13 +590,39 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     logger.info("servo.value %s" % servo.value)
                     time.sleep(0.25)
 
+                    best_hall = None          # 081226: lowest reading so far
+                    last_progress = time.time()
+                    stalled = False
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
                             logger.info("Fully retractd!")
                             break
+
+                        h = getattr(retract_adaptive, "_last_hall", None)
+                        if h is not None:
+                            if best_hall is None or h < (best_hall - cfg["RETRACT_PROGRESS"]):
+                                best_hall = h
+                                last_progress = time.time()
+                            elif (time.time() - last_progress) > cfg["RETRACT_STALL_SEC"]:
+                                gap = h - cfg["HALL_TARGET"]
+                                stalled = True
+                                if gap < cfg["RETRACT_STALL_CLOSE"]:
+                                    logger.info("Retract stalled at hall %d (%d from "
+                                                "target) with no progress for %.1fs - "
+                                                "close enough, treating as retracted"
+                                                % (h, gap, cfg["RETRACT_STALL_SEC"]))
+                                    st["RETRACTED"] = 1
+                                    fsm_st["deploy_allowed"] = True
+                                else:
+                                    logger.info("Retract stalled at hall %d (%d from "
+                                                "target) with no progress for %.1fs - "
+                                                "too far out, stopping. Line may be "
+                                                "jammed. Deploy stays blocked."
+                                                % (h, gap, cfg["RETRACT_STALL_SEC"]))
+                                break
                         time.sleep(0.1)
-                    if (time.time() - t0) >= dur:
+                    if (not stalled) and (time.time() - t0) >= dur:
                         logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
                     retract_adaptive._hall_start = None
                     neutral(servo, cfg)
