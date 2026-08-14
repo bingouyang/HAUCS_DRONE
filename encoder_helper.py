@@ -11,7 +11,13 @@ HEARTBEAT_RATE=1.0
 
 # payload and header for encoding
 DATA_BYTES = 96
-HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
+# 081326: header grew by one byte for chunk_idx. Frames previously carried no
+# position, so a single lost DATA96 packet made the receiver concatenate the
+# survivors at the wrong offsets - the arrays came out short AND mispaired,
+# with no way to tell. chunk_idx lets the receiver place every frame at its
+# true sample offset and leave explicit gaps where a frame never arrived.
+HDR_LEN = 9   # seq_id(4) varbyte(1) base(int16,2) len(1) chunk_idx(1)
+HDR_FMT = "!IBhBB"
 # MAX_SAMPLES is per-variable now; see max_samples(var_id) below.
 # ---- Residue coding, MUST match the other side exactly -------------------
 #
@@ -121,7 +127,7 @@ def build_frames(values, var_id, start_seq, is_resend=False):
     if not values:
         return
 
-    for chunk in chunker(values, n_max):
+    for chunk_idx, chunk in enumerate(chunker(values, n_max)):
         if not chunk:
             continue
 
@@ -148,12 +154,16 @@ def build_frames(values, var_id, start_seq, is_resend=False):
         var_len = len(residues)
         var_byte = (int(var_id) & 0x7F) | (0x80 if is_resend else 0)
 
+        if chunk_idx > 255:
+            print("WARN encoder: var %d chunk_idx %d exceeds one byte" % (var_id, chunk_idx))
+
         header = struct.pack(
-            "!IBhB",
+            HDR_FMT,
             seq & 0xFFFFFFFF,
             var_byte & 0xFF,
             var_base,
             var_len & 0xFF,
+            chunk_idx & 0xFF,
         )
 
         payload = bytearray(header + struct.pack("!" + fmt * var_len, *residues))
