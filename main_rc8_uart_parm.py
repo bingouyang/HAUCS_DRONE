@@ -81,28 +81,37 @@ wParms = {
     "ADC_PIN": 0,
     "HALL_MIN": 2500,
     "HALL_MAX": 12285,
-    # 081226: measured stop. Under continuous retract the reading pins at
-    # 2662 (min 2644, max 2682, stdev 6.7) and drifts +17 counts over 58s,
-    # i.e. it is hard against the stop, not creeping in. The old settle line
-    # of 2550 sat below that floor, so retract could never succeed and every
-    # cycle timed out and blocked deploy. Settle line is now 2800, 118 clear
-    # of the observed max 2682. RETRACT_SETTLE is left at 50 on purpose - it
-    # is also the band for both polarity checks, so widening it there would
-    # have quietly changed two unrelated safeguards.
-    "HALL_TARGET": 2750,
+    "HALL_TARGET": 2500,
     "RETRACT_PWR": 0.1,
     "RELEASE_PWR": -0.40,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
     "RELEASE_SEC": 20,      # 071426: motor drives payload down; overridden by SCR_USER1
     "RETRACT_SETTLE": 50,
-    # 081226: no-progress detector. If the line jams, the old code drove into
-    # it for the full RETRACT_SEC (60s in the 21:43 log). Stop after 5s of no
-    # movement instead: close to target means the goal is met, far from it
-    # means something is stuck and grinding will not help.
-    "RETRACT_STALL_SEC": 5.0,     # seconds of no progress before deciding
-    "RETRACT_PROGRESS": 30,       # counts of inward movement that count as progress
-    "RETRACT_STALL_CLOSE": 500,   # within this of target, a stall means "done"
+    # 081426: ascent sampling scheme.
+    # STEP_MOVE_SEC = 0 keeps the existing continuous retract, unchanged.
+    # STEP_MOVE_SEC > 0 switches the ascent to stepped: drive for
+    # STEP_MOVE_SEC, then sit still for STEP_HOLD_SEC so the DO sensor can
+    # settle before the next stage.
+    #
+    # Why: the probe has a first-order lag of about 2.9 s. Ascending
+    # continuously at ~3.5 in/s smears every reading by v*tau, roughly 10
+    # inches, so features thinner than that are lost. Holding still lets the
+    # reading relax to the true local value; residual error is
+    # step_size * exp(-HOLD/tau).
+    #
+    #   MOVE  HOLD   step    error   stages  total
+    #   1.0   6.0    3.5in   0.44in   11      77s
+    #   0.5   6.0    1.8in   0.22in   21     136s
+    #   2.0   3.0    7.0in   2.49in    6      30s
+    #
+    # RETRACT_SEC must be at least the total, or the ascent is cut short.
+    "STEP_MOVE_SEC": 0.0,     # SCR_USER5; 0 = continuous
+    "STEP_HOLD_SEC": 6.0,     # SCR_USER6; settle time per stage
+    "STEP_BACKWARD_TH": 400,  # counts of upward drift across holds = paying out
+    "STATUS_TO_GCS": 1,       # 081426: 0 disables all operator messages
+    "STATUS_MIN_GAP": 1.0,    # min seconds between routine messages
+    "STATUS_REPEAT_SEC": 30.0,  # suppress an identical error inside this window
     "RETRACT_TH": 8000,
     "PWD_ADP_TH": 10000,
     "LOG_PREFIX": "[WINCH] ",
@@ -350,6 +359,8 @@ def release_win(servo, adc, cfg, st, stop_evt):
             # Aborting used to strand the winch, since nothing else retracts it,
             # so every later cast hit the same check and the session produced
             # flat surface-only profiles.
+            gcs_status("line still out (hall %d), recovering" % hall_start,
+                       cfg, force=True)
             logger.info("Hall reads %d before release (expected near %d). Line "
                         "appears still out - attempting recovery retract, up to %.0fs."
                         % (hall_start, cfg["HALL_TARGET"], RECOVERY_SEC))
@@ -371,6 +382,7 @@ def release_win(servo, adc, cfg, st, stop_evt):
             hall_start = hall_median(adc)
 
             if not recovered and hall_start > cfg["RETRACT_TH"]:
+                gcs_status("ABORT release, line stuck out", cfg, force=True)
                 logger.info("SAFETY ABORT: recovery retract did not clear in %.0fs "
                             "(hall still %d). Aborting release."
                             % (RECOVERY_SEC, hall_start))
@@ -392,6 +404,7 @@ def release_win(servo, adc, cfg, st, stop_evt):
     svalue = cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
     logger.info("Release, winch servo open: %s, duration: %ss" % (svalue, cfg["RELEASE_SEC"]))
+    gcs_status("release %.0fs, sampling started" % cfg["RELEASE_SEC"], cfg, force=True)
     servo.value = float(svalue)
 
     while not stop_evt.is_set():
@@ -405,6 +418,8 @@ def release_win(servo, adc, cfg, st, stop_evt):
             try:
                 hall_now = hall_raw(adc)
                 if hall_now < (hall_start - cfg["RETRACT_SETTLE"]):
+                    gcs_status("ABORT release, probe did NOT go down", cfg,
+                               force=True)
                     logger.info("SAFETY ABORT: Hall sensor decreased during release "
                                 "(%d -> %d). Motor running backwards - possible "
                                 "polarity reversal. Aborting release." %
@@ -439,10 +454,99 @@ def hall_median(adc, n=3, gap=0.02):
     return vals[len(vals) // 2]
 
 
+def retract_stepped(servo, adc, cfg, st, stop_evt, dur):
+    """
+    081426: stepped ascent. Drive STEP_MOVE_SEC, stop, wait STEP_HOLD_SEC,
+    repeat. Returns True if the winch reached the settle window.
+
+    Deliberately does NOT call retract_adaptive. That function owns the
+    continuous path and carries a polarity guard baselined on a single
+    motor start; a stepped ascent restarts the motor at every stage and the
+    ~366 count start transient would trip it. Position is read only during
+    the holds, when the motor is off and the reading is quiet.
+    """
+    move_s = float(cfg.get("STEP_MOVE_SEC", 0.0))
+    hold_s = float(cfg.get("STEP_HOLD_SEC", 6.0))
+    drive = cfg["ROTATION_DIRECTION"] * cfg["RETRACT_PWR"] + cfg["NEUTRAL_POS"]
+    n_est = max(1, int(dur // max(0.1, move_s + hold_s)))
+
+    # 081426: cap stage chatter. Mission Planner's message pane scrolls, so a
+    # fast cycle time could push a real EKF or battery warning out of view
+    # even though severity INFO can never preempt one. Emit at most ~8 stage
+    # messages per ascent whatever the stage count; start / done / abort are
+    # force=True and always get through.
+    msg_every = max(1, n_est // 8)
+
+    t0 = time.time()
+    step = 0
+    prev_hall = None
+    backward = 0
+
+    logger.info("081426 stepped ascent: move %.2fs hold %.2fs, up to %d stages"
+                % (move_s, hold_s, n_est))
+    gcs_status("ascent stepped %.1f/%.1fs x%d" % (move_s, hold_s, n_est),
+               cfg, force=True)
+
+    while not stop_evt.is_set() and (time.time() - t0) < dur:
+        step += 1
+
+        servo.value = float(drive)
+        m_end = time.time() + move_s
+        while time.time() < m_end and not stop_evt.is_set():
+            time.sleep(0.02)
+        neutral(servo, cfg)
+
+        # Motor is off now, so this reading is the quiet one.
+        time.sleep(0.15)
+        try:
+            hall = hall_median(adc)
+        except Exception as e:
+            logger.info("081426 stepped: hall read failed: %s" % e)
+            hall = None
+
+        if hall is not None:
+            dist = hall - cfg["HALL_TARGET"]
+            if dist < cfg["RETRACT_SETTLE"]:
+                st["RETRACTED"] = 1
+                fsm_st["deploy_allowed"] = True
+                logger.info("081426 stepped: retracted after %d stages, %.0fs"
+                            % (step, time.time() - t0))
+                gcs_status("ascent done %d stages %.0fs" %
+                           (step, time.time() - t0), cfg, force=True)
+                return True
+
+            if prev_hall is not None and hall > prev_hall + cfg["STEP_BACKWARD_TH"]:
+                backward += 1
+                if backward >= 2:
+                    logger.info("081426 stepped: SAFETY ABORT, hall rose "
+                                "%d -> %d across holds, line paying out"
+                                % (prev_hall, hall))
+                    gcs_status("ABORT ascent, line paying out", cfg, force=True)
+                    neutral(servo, cfg)
+                    return False
+            else:
+                backward = 0
+            prev_hall = hall
+
+        if step % msg_every == 0:
+            gcs_status("stage %d/%d hall %s hold %.1fs"
+                       % (step, n_est,
+                          hall if hall is not None else "??", hold_s), cfg)
+
+        h_end = time.time() + hold_s
+        while time.time() < h_end and not stop_evt.is_set():
+            if (time.time() - t0) >= dur:
+                break
+            time.sleep(0.05)
+
+    logger.info("081426 stepped: timeout after %d stages" % step)
+    gcs_status("ascent timeout %d stages" % step, cfg, force=True)
+    return False
+
+
 def retract_adaptive(servo, adc, cfg, st):
     try:
         hall_now = hall_raw(adc)
-        retract_adaptive._last_hall = hall_now   # 081226: for the stall check
         dist = hall_now - cfg["HALL_TARGET"]
 
         # --- Retract polarity safeguard ---
@@ -506,6 +610,132 @@ def retract_adaptive(servo, adc, cfg, st):
             st["RETRACTED"] = 0
 
     return False
+
+# 081426: operator-facing status to Mission Planner.
+# MAV_SEVERITY_INFO (6) sits below every mission-critical severity (0-4), so
+# these land in the message pane and can never displace a real warning.
+# Rate limited, and capped at the 50 byte STATUSTEXT payload.
+_status = {"link": None, "last": 0.0}
+
+
+def send_payload_reported(link, cols, state, cfg):
+    """
+    081426: wrapper around send_payload that tells the operator what went out.
+
+    encoder_helper.send_payload uses print(), which the log handler cannot
+    see, so the DATA96 transmission was invisible on the ground. Frame count
+    is derived the same way the encoder chunks: per-variable, using that
+    variable's residue width (pressure is int16, so half the samples fit).
+    """
+    n_frames = 0
+    n_samples = 0
+    try:
+        for name in SEND_ORDER:
+            vals = cols.get(name) or []
+            if not vals:
+                continue
+            width = max_samples(VAR_MAP[name]) if "VAR_MAP" in globals() \
+                else max_samples(SEND_ORDER.index(name))
+            n_frames += (len(vals) + width - 1) // width
+            if name == "DO":
+                n_samples = len(vals)
+    except Exception as e:
+        logger.info("081426 frame count failed: %s" % e)
+
+    before = sum(len(v) for v in (state.get("failed") or {}).values())
+    gcs_status("TX %d frames, %d samples" % (n_frames, n_samples), cfg,
+               force=True)
+
+    send_payload(link, cols, state)
+
+    after = sum(len(v) for v in (state.get("failed") or {}).values())
+    if after > before:
+        logger.info("TX incomplete: %d frames buffered to outbox" % after)
+    else:
+        gcs_status("TX done %d frames" % n_frames, cfg, force=True)
+
+
+def set_status_link(m):
+    _status["link"] = m
+
+
+# 081426: anything that looks like a failure goes to the operator's screen.
+# Most of this file reports failures with logger.info rather than warning or
+# error, so level alone is not enough - match on wording as well.
+# Bare "timeout" is deliberately absent: "Queue RETRACT with timeout 60s" is
+# routine. Match the failure wording instead.
+ERROR_WORDS = ("abort", "error", " fail", "failed", "corrupt", "warning",
+               "not fully retracted", "prevented", "stuck", "backwards",
+               "no heartbeat", "no response", "no samples", "timed out",
+               "ignored", "exception", "unable", "invalid", "not connected")
+
+_errstate = {"last": {}, "in_emit": False}
+
+
+class GcsLogHandler(logging.Handler):
+    """
+    Forwards failures to Mission Planner as STATUSTEXT.
+
+    Deduplicated: an identical message repeating inside STATUS_REPEAT_SEC is
+    counted, not resent, and the count is shown when it does go out. Without
+    that, a winch stuck in a retract-fail loop would repeat the same line
+    every cycle and scroll everything else off the pane.
+    """
+
+    def __init__(self, cfg):
+        logging.Handler.__init__(self)
+        self.cfg = cfg
+
+    def emit(self, record):
+        if _errstate["in_emit"]:
+            return                      # gcs_status logs on failure; no recursion
+        try:
+            msg = record.getMessage()
+            low = msg.lower()
+            if record.levelno < logging.WARNING and \
+                    not any(w in low for w in ERROR_WORDS):
+                return
+
+            key = low[:40]
+            now = time.time()
+            seen = _errstate["last"].get(key)
+            window = self.cfg.get("STATUS_REPEAT_SEC", 30.0)
+            if seen and (now - seen[0]) < window:
+                seen[1] += 1
+                return
+            count = (seen[1] if seen else 0)
+            _errstate["last"][key] = [now, 0]
+
+            text = msg.strip()
+            if count:
+                text = "%s (x%d)" % (text, count + 1)
+            _errstate["in_emit"] = True
+            try:
+                gcs_status(text, self.cfg, force=True)
+            finally:
+                _errstate["in_emit"] = False
+        except Exception:
+            pass
+
+
+def gcs_status(text, cfg=None, force=False):
+    m = _status["link"]
+    if m is None:
+        return
+    cfg = cfg or {}
+    if not cfg.get("STATUS_TO_GCS", 1):
+        return
+    now = time.time()
+    if not force and (now - _status["last"]) < cfg.get("STATUS_MIN_GAP", 1.0):
+        return
+    _status["last"] = now
+    try:
+        m.mav.statustext_send(
+            mavutil.mavlink.MAV_SEVERITY_INFO,
+            ("HAUCS: " + text)[:49].encode("ascii", "replace"))
+    except Exception as e:
+        logger.info("081426 statustext failed: %s" % e)
+
 
 def neutral(servo, cfg):
     servo.value = cfg["NEUTRAL_POS"]
@@ -583,6 +813,15 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 elif act == "RETRACT":
                     dur = float(cmd.get("duration", 0.0))
                     logger.info("RETRACT for %ss" % dur)
+                    # 081426: stepped ascent when SCR_USER5 > 0, otherwise the
+                    # original continuous retract below, untouched.
+                    if float(cfg.get("STEP_MOVE_SEC", 0.0)) > 0.0:
+                        retract_stepped(servo, adc, cfg, st, stop_evt, dur)
+                        retract_adaptive._hall_start = None
+                        neutral(servo, cfg)
+                        q_winch.task_done()
+                        continue
+
                     t0 = time.time()
                     # Start each retract with a fresh Hall-direction baseline.
                     retract_adaptive._hall_start = None
@@ -590,39 +829,14 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     logger.info("servo.value %s" % servo.value)
                     time.sleep(0.25)
 
-                    best_hall = None          # 081226: lowest reading so far
-                    last_progress = time.time()
-                    stalled = False
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
                             logger.info("Fully retractd!")
                             break
 
-                        h = getattr(retract_adaptive, "_last_hall", None)
-                        if h is not None:
-                            if best_hall is None or h < (best_hall - cfg["RETRACT_PROGRESS"]):
-                                best_hall = h
-                                last_progress = time.time()
-                            elif (time.time() - last_progress) > cfg["RETRACT_STALL_SEC"]:
-                                gap = h - cfg["HALL_TARGET"]
-                                stalled = True
-                                if gap < cfg["RETRACT_STALL_CLOSE"]:
-                                    logger.info("Retract stalled at hall %d (%d from "
-                                                "target) with no progress for %.1fs - "
-                                                "close enough, treating as retracted"
-                                                % (h, gap, cfg["RETRACT_STALL_SEC"]))
-                                    st["RETRACTED"] = 1
-                                    fsm_st["deploy_allowed"] = True
-                                else:
-                                    logger.info("Retract stalled at hall %d (%d from "
-                                                "target) with no progress for %.1fs - "
-                                                "too far out, stopping. Line may be "
-                                                "jammed. Deploy stays blocked."
-                                                % (h, gap, cfg["RETRACT_STALL_SEC"]))
-                                break
                         time.sleep(0.1)
-                    if (not stalled) and (time.time() - t0) >= dur:
+                    if (time.time() - t0) >= dur:
                         logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
                     retract_adaptive._hall_start = None
                     neutral(servo, cfg)
@@ -743,6 +957,13 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 "finish sampling - queue mav cmd to upload data, ok: %s, sample_size:%s"
                                 % (ok, s_size)
                             )
+                            # 081426: the message the operator is waiting for.
+                            try:
+                                _n = int(s_size[1])
+                            except Exception:
+                                _n = -1
+                            gcs_status("CAST COMPLETE, %d samples" % _n,
+                                       wincfg, force=True)
                             do_list = ble.sdata.get("do_vals") or []
                             if ok and len(do_list) > 0:
                                 temp_list = ble.sdata.get("temp_vals") or []
@@ -785,6 +1006,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             else:
                                 st["c_status"] = "fetch_empty"
                                 logger.info("BLE fetch returned no samples; upload skipped")
+                                gcs_status("CAST COMPLETE but 0 samples", wincfg, force=True)
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
                             logger.info("fetch failed: %s" % e)
@@ -840,12 +1062,18 @@ def ble_close(ble):
 # SCR_USER2 = PAUSE_SEC    (idle time at bottom before retract)
 # SCR_USER3 = RETRACT_SEC  (maximum retract duration / safety timeout)
 # SCR_USER4 = shutdown flag (set to 1 in Mission Planner to cleanly shut down Pi)
+# SCR_USER5 = STEP_MOVE_SEC  (0 = continuous ascent, >0 = stepped)
+# SCR_USER6 = STEP_HOLD_SEC  (settle time at each stage)
 #             Pi polls this each loop; triggers "sudo shutdown -h now" when == 1
 # If a timing parameter is 0 or unset, the local wParms default is kept.
 SCR_USER_MAP = {
     "SCR_USER1": "RELEASE_SEC",
     "SCR_USER2": "PAUSE_SEC",
     "SCR_USER3": "RETRACT_SEC",
+    # 081426: SCR_USER4 is the shutdown flag, so the ascent scheme uses 5 and 6.
+    # SCR_USER5 = 0 leaves STEP_MOVE_SEC at its 0.0 default, i.e. continuous.
+    "SCR_USER5": "STEP_MOVE_SEC",
+    "SCR_USER6": "STEP_HOLD_SEC",
 }
 SCR_USER_SHUTDOWN = "SCR_USER4"   # set to 1 in Mission Planner to trigger Pi shutdown
 SCR_USER_SHUTDOWN_POLL_SEC = 5.0  # how often to poll SCR_USER4 (seconds)
@@ -921,6 +1149,8 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 
         # CHANGED: UART-only. Send payloads back through the flight-controller link.
         payload_link = m_fc
+        set_status_link(m_fc)   # 081426: operator status to Mission Planner
+        logger.addHandler(GcsLogHandler(wincfg))
         # 071426: Store m_fc ref so fetch_scr_user_params can be called before each release.
         mav_fc_ref = m_fc
 
@@ -1030,7 +1260,10 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 
                 if flags["deploy_needed"]:
                     if not fsm_st["deploy_allowed"] or winst["RETRACTED"] != 1:
-                        logger.info("Deploy ignored: not allowed or not retracted")
+                        logger.info("Deploy ignored: winch not retracted "
+                                    "(RETRACTED=%s, hall not at target). "
+                                    "Sampling is blocked until a retract "
+                                    "completes." % winst["RETRACTED"])
                     else:
                         fsm_st["deploy_allowed"] = False   # lock it immediately
 
@@ -1062,7 +1295,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 
                     if data_sim_flag is True:
                         cols = prep_sim_data(csv_path)
-                        send_payload(payload_link, cols, sensor_state)
+                        send_payload_reported(payload_link, cols, sensor_state, wincfg)
                     else:
                         logger.info("MAV to BLE: fetch data from BLE sensor")
                         q_ble.put({"action": "FETCH"})
@@ -1129,7 +1362,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 
                 try:
                     logger.info("Uploading fetched BLE data: cols:%s" % cols)
-                    send_payload(payload_link, cols, sensor_state)
+                    send_payload_reported(payload_link, cols, sensor_state, wincfg)
                 except Exception as e:
                     logger.info("SENDPAYLOAD failed, MAV thread will continue: %s" % e)
                     logger.info(traceback.format_exc())
