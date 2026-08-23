@@ -23,6 +23,7 @@ Verdicts:
 import sys
 import re
 import csv
+import glob
 from datetime import datetime
 
 # Tuning. MOVE_TH is in raw Hall counts; the winch spans roughly 2500..12285,
@@ -150,8 +151,20 @@ def main():
         print(__doc__)
         return 1
 
+    # Windows shells do not expand wildcards, so do it here. Sorted so the
+    # output runs oldest to newest when filenames carry a date stamp.
+    paths = []
+    for a in args:
+        hits = sorted(glob.glob(a))
+        if hits:
+            paths.extend(hits)
+        else:
+            print("no match: %s" % a)
+    if not paths:
+        return 1
+
     rows = []
-    for path in args:
+    for path in paths:
         for ev in parse(path):
             verdict, note = classify(ev)
             rows.append({
