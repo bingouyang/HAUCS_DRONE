@@ -34,6 +34,12 @@ FLAT_MIN = 3.0     # seconds of no progress at the end to call it a stall
 HALL_LO = 0        # plausible reading window; outside = suspect sensor
 HALL_HI = 13000
 
+# Hall reading at or below which retract_adaptive() takes the settle branch
+# and calls neutral(). Flat readings below this line mean the winch finished
+# and the servo stopped - NOT that it is grinding against a stop. Must match
+# HALL_TARGET + RETRACT_SETTLE in the config the log was produced under.
+SETTLE_HALL = 2500 + 50
+
 TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]?(\d*)")
 RE_START = re.compile(r"RETRACT for ([\d.]+)s")
 RE_HALL = re.compile(r"currnt hall_raw val:\s*(-?\d+)")
@@ -70,6 +76,14 @@ def classify(ev):
 
     if travel < MOVE_TH:
         return "NO-MOTION", "Hall flat at ~%d for the whole attempt" % halls[0]
+
+    # Below the settle line the code neutrals the servo, so a flat trace here
+    # means finished-and-stopped. The timeout warning in the log is spurious:
+    # st["RETRACTED"] was already 1, so retract_adaptive() never returned True.
+    if halls[-1] < SETTLE_HALL:
+        return "SETTLED-NO-FLAG", ("reached %d, below settle line %d; servo "
+                                   "neutraled, timeout warning is spurious"
+                                   % (halls[-1], SETTLE_HALL))
 
     # Walk back from the end counting how long progress had stopped.
     flat_n = 0
