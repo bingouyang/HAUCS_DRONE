@@ -52,11 +52,26 @@ def main():
     ap.add_argument("--baud", type=int, default=FC_BAUD)
     ap.add_argument("--listen", action="store_true",
                     help="also print STATUSTEXT coming back from the FC")
+    ap.add_argument("--sysid", type=int, default=1,
+                    help="our MAVLink system id (default 1 = same as vehicle)")
+    ap.add_argument("--compid", type=int, default=191,
+                    help="our component id (default 191 = ONBOARD_COMPUTER)")
+    ap.add_argument("--heartbeat", action="store_true",
+                    help="also emit HEARTBEAT. MAVProxy prints 'online system N' "
+                         "the first time it sees a new system id, so pairing this "
+                         "with --sysid 42 proves whether the FC relays Pi traffic "
+                         "to the telemetry link at all.")
     args = ap.parse_args()
 
-    print("opening %s @ %d" % (args.port, args.baud))
+    print("opening %s @ %d as sys=%d comp=%d"
+          % (args.port, args.baud, args.sysid, args.compid))
     try:
-        m = mavutil.mavlink_connection(args.port, baud=args.baud)
+        # Identify as the onboard computer, NOT as 255. Mission Planner is 255,
+        # and ArduPilot will not forward a packet out to a link where it already
+        # believes that system id lives - the STATUSTEXT gets dropped as a loop.
+        m = mavutil.mavlink_connection(args.port, baud=args.baud,
+                                       source_system=args.sysid,
+                                       source_component=args.compid)
     except Exception as e:
         print("FAILED to open the serial port: %s" % e)
         print("  - is main_rc8_uart_parm.py still running? stop it first")
@@ -64,18 +79,47 @@ def main():
         print("  - check permissions:      groups | grep dialout")
         return 1
 
-    print("waiting for HEARTBEAT from the Cube (10s)...")
-    hb = m.wait_heartbeat(timeout=10)
-    if not hb:
-        print("NO HEARTBEAT.")
-        print("  The Pi cannot talk to the flight controller at all, so no")
-        print("  STATUSTEXT can reach the GCS. Check UART wiring, that the FC")
-        print("  serial port is SERIALn_PROTOCOL=2 (MAVLink2), and that its")
-        print("  BAUD matches %d." % args.baud)
+    # A plain wait_heartbeat() matches ANY heartbeat, including the GCS's own
+    # relayed through the FC (sys 255, MAV_TYPE_GCS=6). That looks like success
+    # while proving nothing about the Cube, so filter for a real autopilot.
+    print("waiting for an AUTOPILOT heartbeat (10s)...")
+    seen = {}
+    fc = None
+    t_end = time.time() + 10
+    while time.time() < t_end:
+        hb = m.recv_match(type="HEARTBEAT", blocking=False)
+        if hb is None:
+            time.sleep(0.02)
+            continue
+        key = (hb.get_srcSystem(), hb.get_srcComponent())
+        if key not in seen:
+            seen[key] = (hb.type, hb.autopilot)
+        is_ap = (hb.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                 and hb.type != mavutil.mavlink.MAV_TYPE_GCS)
+        if is_ap and fc is None:
+            fc = hb
+            break
+
+    if seen:
+        print("heartbeat sources seen:")
+        for (sysid, compid), (typ, ap_) in sorted(seen.items()):
+            tag = "AUTOPILOT" if (ap_ != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                                  and typ != mavutil.mavlink.MAV_TYPE_GCS) else "not an autopilot"
+            print("   sys=%-4d comp=%-4d type=%-3d %s" % (sysid, compid, typ, tag))
+
+    if fc is None:
+        print("\nNO AUTOPILOT HEARTBEAT.")
+        if seen:
+            print("  Traffic IS arriving, but none of it is from the Cube -")
+            print("  what you see above is the GCS relayed through the FC.")
+            print("  The Pi->FC leg is unproven. Check UART wiring and that the")
+            print("  FC port is SERIALn_PROTOCOL=2 at %d baud." % args.baud)
+        else:
+            print("  No MAVLink at all on this port.")
         return 1
 
-    print("connected: sys=%s comp=%s  (FC type %s)"
-          % (hb.get_srcSystem(), hb.get_srcComponent(), hb.type))
+    print("\nAUTOPILOT found: sys=%s comp=%s type=%s"
+          % (fc.get_srcSystem(), fc.get_srcComponent(), fc.type))
     print("sending %d message(s), %.1fs apart\n" % (args.count, args.interval))
 
     sent = 0
@@ -83,9 +127,16 @@ def main():
         text = "%s %d/%d %s" % (args.text, i, args.count,
                                 time.strftime("%H:%M:%S"))
         try:
+            if args.heartbeat:
+                # Announce ourselves as an onboard controller. This is the packet
+                # MAVProxy reacts to visibly, unlike STATUSTEXT which it may drop
+                # silently if it filters on source system.
+                m.mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
             shown = send_status(m, text)
             sent += 1
-            print("  sent: %s" % shown)
+            print("  sent: %s%s" % (shown, "  (+heartbeat)" if args.heartbeat else ""))
         except Exception as e:
             print("  send FAILED: %s" % e)
 
@@ -110,13 +161,18 @@ def main():
     print("Now check Mission Planner's Messages tab (Ctrl-F -> Messages, or")
     print("the message line under the HUD).")
     print("")
-    print("If they appear      -> the path works; gcs_status() will too.")
-    print("If they do NOT      -> the Pi->FC link is fine (heartbeat proved it),")
-    print("                       so the break is FC->GCS. Check that the")
-    print("                       telemetry radio's SERIALn_PROTOCOL is 2, that")
-    print("                       Mission Planner is connected on that link, and")
-    print("                       that SRn_EXTRA3 / the STATUSTEXT stream is not")
-    print("                       set to 0.")
+    print("If they appear -> the path works. Then apply the same source_system")
+    print("   /source_component to main_rc8_uart_parm.py line ~1060, which today")
+    print("   opens the link with no ids and so transmits as 255 like this")
+    print("   script used to:")
+    print("       m_fc = mavutil.mavlink_connection(FC_CONN_STR, baud=FC_BAUD,")
+    print("                                         source_system=1,")
+    print("                                         source_component=191)")
+    print("")
+    print("If they do NOT -> try a different id pair (--sysid 1 --compid 25, or")
+    print("   --sysid 42), then check the telemetry port's SERIALn_PROTOCOL=2 and")
+    print("   that SRn_EXTRA3 is not 0. Run with --listen to confirm traffic is")
+    print("   flowing both ways on this port.")
     return 0
 
 
