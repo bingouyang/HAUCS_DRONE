@@ -62,6 +62,9 @@ COPTER_MODES = {
 # ---------------- CONFIG ----------------
 # Primary flight controller link: Pi to Cube Orange over UART
 FC_CONN_STR = "/dev/serial0"
+# 082426: Mission Planner promotes STATUSTEXT at WARNING (4) or lower to the HUD
+# message line. NOTICE (5) and INFO (6) land in the Messages tab only.
+SEV_ALERT = 4
 FC_BAUD = 115200
 
 # Optional forwarding to PC or GCS
@@ -379,7 +382,8 @@ def release_win(servo, adc, cfg, st, stop_evt):
             hall_start = hall_median(adc)
 
             if not recovered and hall_start > cfg["RETRACT_TH"]:
-                gcs_status("ABORT release, line stuck out", cfg, force=True)
+                gcs_status("ABORT release, line stuck out", cfg, force=True,
+                           sev=SEV_ALERT)
                 logger.info("SAFETY ABORT: recovery retract did not clear in %.0fs "
                             "(hall still %d). Aborting release."
                             % (RECOVERY_SEC, hall_start))
@@ -511,7 +515,8 @@ def retract_stepped(servo, adc, cfg, st, stop_evt, dur):
             time.sleep(0.05)
 
     logger.info("081426 stepped: timeout after %d stages" % step)
-    gcs_status("ascent timeout %d stages" % step, cfg, force=True)
+    gcs_status("ascent timeout %d stages" % step, cfg, force=True,
+               sev=SEV_ALERT)
     return False
 
 
@@ -667,14 +672,16 @@ class GcsLogHandler(logging.Handler):
                 text = "%s (x%d)" % (text, count + 1)
             _errstate["in_emit"] = True
             try:
-                gcs_status(text, self.cfg, force=True)
+                gcs_status(text, self.cfg, force=True, sev=SEV_ALERT)  # 082426
             finally:
                 _errstate["in_emit"] = False
         except Exception:
             pass
 
 
-def gcs_status(text, cfg=None, force=False):
+def gcs_status(text, cfg=None, force=False, sev=None):
+    # 082426: sev picks where Mission Planner shows it. Default INFO keeps
+    # routine progress in the Messages tab; SEV_ALERT puts it on the HUD too.
     m = _status["link"]
     if m is None:
         return
@@ -687,7 +694,7 @@ def gcs_status(text, cfg=None, force=False):
     _status["last"] = now
     try:
         m.mav.statustext_send(
-            mavutil.mavlink.MAV_SEVERITY_INFO,
+            sev if sev is not None else mavutil.mavlink.MAV_SEVERITY_INFO,
             ("HAUCS: " + text)[:49].encode("ascii", "replace"))
     except Exception as e:
         logger.info("081426 statustext failed: %s" % e)
@@ -962,7 +969,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             else:
                                 st["c_status"] = "fetch_empty"
                                 logger.info("BLE fetch returned no samples; upload skipped")
-                                gcs_status("CAST COMPLETE but 0 samples", wincfg, force=True)
+                                gcs_status("CAST COMPLETE but 0 samples", wincfg,
+                                           force=True, sev=SEV_ALERT)
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
                             logger.info("fetch failed: %s" % e)
