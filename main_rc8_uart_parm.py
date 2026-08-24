@@ -345,9 +345,8 @@ def hall_raw(c):
 def release_win(servo, adc, cfg, st, stop_evt):
     # 071426: Hall sensor check removed from early-exit logic. Mechanism is
     # direct-drive descent at low power (RELEASE_PWR) for RELEASE_SEC duration.
-    # 082326: direction checks removed. The Hall pre-check remains, and it is a
-    # line-position check, not a polarity one: if the line reads still out,
-    # recover it before releasing.
+    # 082326: Hall pre-check retained, but it is a line-position check, not a
+    # polarity check: if the line reads still out, recover it before releasing.
 
     # --- Pre-release Hall sensor sanity check ---
     RECOVERY_SEC = 10.0
@@ -410,8 +409,8 @@ def release_win(servo, adc, cfg, st, stop_evt):
             logger.info("Release complete: RELEASE_SEC=%ss reached" % cfg["RELEASE_SEC"])
             break
 
-        # 082326: mid-release direction check removed with the other polarity
-        # guards.
+        # 082326: mid-release polarity check removed; the servo no longer
+        # flips direction on its own.
         time.sleep(0.1)
 
     st["RETRACTED"] = 0  # mark as extended after descent completes
@@ -496,7 +495,7 @@ def retract_stepped(servo, adc, cfg, st, stop_evt, dur):
                            (step, time.time() - t0), cfg, force=True)
                 return True
 
-            # 082326: backward-direction abort removed with the other polarity
+            # 082426: backward-direction abort removed with the other polarity
             # guards; the servo memory flag is disabled, so direction no longer
             # flips on its own.
 
@@ -783,6 +782,10 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     logger.info("servo.value %s" % servo.value)
                     time.sleep(0.25)
 
+                    # 082426: no-progress stall guard removed. On this Hall
+                    # sensor a moving winch far from home reads flat for
+                    # seconds, so "no progress" cannot be told from "stalled",
+                    # and any fixed threshold breaks at a different cast depth.
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
@@ -1057,7 +1060,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
     logger.info("MAVLINK: starting on FC link %s @ %s" % (FC_CONN_STR, FC_BAUD))
 
     try:
-        m_fc = mavutil.mavlink_connection(FC_CONN_STR, baud=FC_BAUD)
+        #m_fc = mavutil.mavlink_connection(FC_CONN_STR, baud=FC_BAUD)
+        ## 082426 - using system=1 and component=191.
+        m_fc = mavutil.mavlink_connection(FC_CONN_STR, baud=FC_BAUD,
+                                  source_system=1,
+                                  source_component=191)
 
         logger.info("MAVLINK: waiting for HEARTBEAT from Cube...")
         hb = m_fc.wait_heartbeat(timeout=10)
