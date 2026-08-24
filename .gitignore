@@ -4,4 +4,4 @@
 *.csv
 *.pyc
 fb_key.json
-_pycache/*.pyc
+__pycache__/
