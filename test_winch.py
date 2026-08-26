@@ -30,7 +30,7 @@ MIN_PW           = 0.0009
 MAX_PW           = 0.0021
 FRAME            = 0.02
 NEUTRAL_POS      = 0.0
-ROTATION_DIR     = 1      # -1 or 1; flip if motor runs backwards
+ROTATION_DIR     = -1      # -1 or 1; flip if motor runs backwards
 RELEASE_PWR      = 0.10    # power for extend (release)
 RETRACT_PWR      = 0.30    # power for retract
 
