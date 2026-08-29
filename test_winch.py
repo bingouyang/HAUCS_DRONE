@@ -14,7 +14,7 @@ Use this to verify:
 Controls:
   r  = release (extend) at RELEASE_PWR
   t  = retract at RETRACT_PWR
-  z  = neutral (stop)
+  z  = stop pulses (servo off, draws nothing)
   a  = nudge more negative (finer control)
   d  = nudge more positive (finer control)
   q  = quit
@@ -31,8 +31,13 @@ MAX_PW           = 0.0021
 FRAME            = 0.02
 NEUTRAL_POS      = 0.0
 ROTATION_DIR     = -1      # -1 or 1; flip if motor runs backwards
-RELEASE_PWR      = 0.10    # power for extend (release)
-RETRACT_PWR      = 0.30    # power for retract
+# 082526: were RELEASE_PWR 0.10 / RETRACT_PWR 0.30, which with the extra sign
+# flip on retract below made r and t drive the winch OPPOSITE to the flight
+# code: r sent -0.10 (the flight code's retract) and t sent +0.30 (its
+# release). Any direction or polarity conclusion from this script was backwards.
+# Now matched to wParms in main_rc8_uart_parm.py.
+RELEASE_PWR      = -0.30   # extend (release); wParms RELEASE_PWR
+RETRACT_PWR      = 0.10    # retract;          wParms RETRACT_PWR
 
 ADC_CHANNEL      = 0
 HALL_TARGET      = 2500    # expected when fully retracted
@@ -93,14 +98,14 @@ def main():
     print("  RELEASE_PWR  : %.2f  (servo value %.3f)" % (
         RELEASE_PWR, ROTATION_DIR * RELEASE_PWR + NEUTRAL_POS))
     print("  RETRACT_PWR  : %.2f  (servo value %.3f)" % (
-        RETRACT_PWR, -ROTATION_DIR * RETRACT_PWR + NEUTRAL_POS))
+        RETRACT_PWR, ROTATION_DIR * RETRACT_PWR + NEUTRAL_POS))   # 082526
     print("  HALL_TARGET  : %d  (retracted)" % HALL_TARGET)
     print("  RETRACT_TH   : %d  (extended)" % RETRACT_TH)
     print()
     print("  Controls:")
     print("    r = RELEASE (extend) at RELEASE_PWR")
     print("    t = RETRACT at RETRACT_PWR")
-    print("    z = NEUTRAL (stop)")
+    print("    z = STOP PULSES (servo off - the flight code's neutral())")
     print("    a = nudge negative   d = nudge positive")
     print("    q = quit")
     print()
@@ -157,13 +162,19 @@ def main():
                 elif ch == 'r':
                     v = ROTATION_DIR * RELEASE_PWR + NEUTRAL_POS
                 elif ch == 't':
-                    v = -ROTATION_DIR * RETRACT_PWR + NEUTRAL_POS
+                    # 082526: was -ROTATION_DIR, an extra flip the flight
+                    # code does not have.
+                    v = ROTATION_DIR * RETRACT_PWR + NEUTRAL_POS
                 elif ch == 'z':
-                    v = NEUTRAL_POS
+                    # 082526: neutral() in the flight code stops the pulse
+                    # train rather than holding 1500us, because a servo told to
+                    # hold still still draws current and heats. Same here.
+                    v = None
                 elif ch == 'a':
-                    v = max(-1.0, v - NUDGE_STEP)
+                    # 082526: v is None after z, so nudge from neutral.
+                    v = max(-1.0, (NEUTRAL_POS if v is None else v) - NUDGE_STEP)
                 elif ch == 'd':
-                    v = min(+1.0, v + NUDGE_STEP)
+                    v = min(+1.0, (NEUTRAL_POS if v is None else v) + NUDGE_STEP)
                 srv.value = v
 
             # Hall sensor reading
@@ -183,12 +194,14 @@ def main():
 
             b   = bar(hall, HALL_TARGET, HALL_MAX)
             st  = hall_status(hall)
-            usec = servo_usec(v)
+            usec = -1 if v is None else servo_usec(v)   # 082526: -1 = no pulses
 
             # show what the servo value implies for the winch
             release_val = ROTATION_DIR * RELEASE_PWR + NEUTRAL_POS
-            retract_val = -ROTATION_DIR * RETRACT_PWR + NEUTRAL_POS
-            if abs(v - NEUTRAL_POS) < 0.001:
+            retract_val = ROTATION_DIR * RETRACT_PWR + NEUTRAL_POS   # 082526
+            if v is None:
+                action = "OFF     "   # 082526: pulses stopped
+            elif abs(v - NEUTRAL_POS) < 0.001:
                 action = "NEUTRAL "
             elif abs(v - release_val) < 0.001:
                 action = "RELEASE "
@@ -199,8 +212,9 @@ def main():
             else:
                 action = "~retract"
 
-            print("  %-6.3f %-8s %-7d  %-6d  %s  %-10s  %s" % (
-                v, action, usec, hall, b, st, direction), end="\r", flush=True)
+            print("  %-6s %-8s %-7d  %-6d  %s  %-10s  %s" % (
+                ("None" if v is None else "%+.3f" % v),
+                action, usec, hall, b, st, direction), end="\r", flush=True)
 
             prev_hall = hall
 
@@ -208,7 +222,7 @@ def main():
         pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        srv.value = NEUTRAL_POS
+        srv.value = None   # 082526: stop pulses; no need to hold neutral first
         time.sleep(0.2)
         srv.detach()
         print()
@@ -230,7 +244,7 @@ def main():
     print("  [ ] Hall DECREASES when you press t (retract)")
     print("  [ ] Hall near %d when fully retracted" % HALL_TARGET)
     print("  [ ] Hall near %d when fully extended" % HALL_MAX)
-    print("  [ ] Servo stops cleanly on z (neutral)")
+    print("  [ ] Servo stops cleanly on z, and STAYS COOL with pulses off")
     print()
     print("  If Hall direction is REVERSED:")
     print("    Option 1: flip ROTATION_DIR from %d to %d in this file and main script" % (

@@ -127,6 +127,16 @@ wParms = {
     "STATUS_TO_GCS": 1,       # 081426: 0 disables all operator messages
     "STATUS_MIN_GAP": 1.0,    # min seconds between routine messages
     "STATUS_REPEAT_SEC": 30.0,  # suppress an identical error inside this window
+    # 082526: latch pulse. The old scheme drove at RELEASE_PWR for the full
+    # RELEASE_SEC, so after the latch opened (~0.25 s) the servo spent the
+    # remainder stalled against a mechanism that could not move - same
+    # direction, same shaft angle, every cast. Three servos ended up sluggish
+    # or binding in exactly that direction. Drive in short pulses instead,
+    # with the servo off between, so a stuck latch costs two brief pushes
+    # rather than seconds of held torque.
+    "LATCH_PULSE_SEC": 0.25,   # drive time per attempt
+    "LATCH_REST_SEC": 0.30,    # servo off between attempts
+    "LATCH_TRIES": 2,          # first attempt plus one retry, then give up
     "RETRACT_TH": 8000,
     "PWD_ADP_TH": 10000,
     "LOG_PREFIX": "[WINCH] ",
@@ -417,41 +427,76 @@ def release_win(servo, adc, cfg, st, stop_evt):
 
     svalue = cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
-    logger.info("Release, winch servo open: %s, duration: %ss" % (svalue, cfg["RELEASE_SEC"]))
-    gcs_status("release %.0fs, sampling started" % cfg["RELEASE_SEC"], cfg, force=True)
-    servo.value = float(svalue)
-
-    # 082426: Hall-terminated release. The drive only has to trip the latch;
-    # once the payload is falling the spool free-spins and the sensor tracks
-    # it, so the servo can stop as soon as the line reads out. RELEASE_SEC is
-    # now only a backstop for a Hall that never confirms.
+    # 082426: "duration" was accurate in the direct-drive file, where the servo
+    # ran for exactly RELEASE_SEC. Here the drive ends on the Hall reading and
+    # RELEASE_SEC is only the backstop, so say so.
+    logger.info("Release, winch servo open: %s, ends on hall dist > %s "
+                "(backstop %ss)"
+                % (svalue, cfg["RETRACT_TH"], cfg["RELEASE_SEC"]))
+    gcs_status("release started, sampling", cfg, force=True)
+    # 082526: pulsed latch release. The drive only has to trip the latch; once
+    # the payload is falling the spool free-spins and the Hall tracks it, so
+    # the servo stops as soon as the line reads out. Driving in short pulses
+    # bounds the stall if the latch sticks, and releasing torque between
+    # attempts often frees a stuck mechanism where sustained pressure does
+    # not. RELEASE_SEC remains an overall backstop.
     #
-    # Read before the first sleep so a fast latch is caught on the first pass,
-    # which is what kept the drive to ~0.1-0.25 s in the 01f64c0 build.
+    # Hall is read before the first sleep so a fast latch is caught on the
+    # first pass, which is what kept the drive to ~0.1-0.25 s originally.
     released = False
-    while not stop_evt.is_set():
-        try:
-            dist = hall_raw(adc) - cfg["HALL_TARGET"]
-        except Exception as e:
-            # Sensor read failed. Fall back to the timer rather than driving
-            # blind or stopping early with the line possibly still in.
-            logger.info("Release Hall read failed: %s - using RELEASE_SEC" % e)
-            dist = None
+    n_rel = 0
+    tries = int(cfg.get("LATCH_TRIES", 2))
 
-        if dist is not None and dist > cfg["RETRACT_TH"]:
-            released = True
-            logger.info("Release complete: hall dist %d > RETRACT_TH %d after "
-                        "%.2fs, line is out" % (dist, cfg["RETRACT_TH"],
-                                                time.time() - t0))
+    for attempt in range(1, tries + 1):
+        if stop_evt.is_set():
             break
+        if attempt > 1:
+            logger.info("latch retry %d of %d after %.1fs rest"
+                        % (attempt, tries, cfg["LATCH_REST_SEC"]))
+        servo.value = float(svalue)
+        t_pulse = time.time()
 
-        if (time.time() - t0) > cfg["RELEASE_SEC"]:
-            logger.info("WARNING: Release timeout, RELEASE_SEC=%ss reached "
-                        "without Hall confirming the line is out"
-                        % cfg["RELEASE_SEC"])
+        while not stop_evt.is_set():
+            try:
+                dist = hall_raw(adc) - cfg["HALL_TARGET"]
+            except Exception as e:
+                # Sensor read failed. Let the pulse run its course rather than
+                # driving blind or stopping early with the line possibly in.
+                logger.info("Release Hall read failed: %s" % e)
+                dist = None
+
+            # 082426: log the descent so RETRACT_TH and the pulse length can
+            # be tuned from a real trace. Every 4th pass keeps this to ~5 Hz.
+            if dist is not None:
+                n_rel += 1
+                if (n_rel % 4) == 1:
+                    logger.info("release dist: %d at %.2fs" % (dist, time.time() - t0))
+
+            if dist is not None and dist > cfg["RETRACT_TH"]:
+                released = True
+                logger.info("Release complete: hall dist %d > RETRACT_TH %d "
+                            "after %.2fs (attempt %d), line is out"
+                            % (dist, cfg["RETRACT_TH"], time.time() - t0, attempt))
+                break
+
+            if (time.time() - t_pulse) > cfg["LATCH_PULSE_SEC"]:
+                break                       # pulse done, latch did not open
+            if (time.time() - t0) > cfg["RELEASE_SEC"]:
+                break                       # overall backstop
+            time.sleep(0.05)
+
+        # 082526: servo off between attempts. This is the whole point - the
+        # old scheme held torque for the remainder of RELEASE_SEC instead.
+        neutral(servo, cfg)
+        if released or (time.time() - t0) > cfg["RELEASE_SEC"]:
             break
+        if attempt < tries:
+            time.sleep(cfg["LATCH_REST_SEC"])
 
-        time.sleep(0.05)
+    if not released:
+        logger.info("WARNING: latch did not open in %d attempts of %.2fs; "
+                    "Hall never confirmed the line is out"
+                    % (tries, cfg["LATCH_PULSE_SEC"]))
 
     # 082426: clear RETRACTED here, on Hall evidence, exactly as 01f64c0 did.
     # The direct-drive file only clears it inside retract_adaptive() when dist
@@ -597,14 +642,14 @@ def retract_adaptive(servo, adc, cfg, st):
             st["RETRACTED"] = 1
             fsm_st["deploy_allowed"] = True
             logger.info("Deploy re-enabled (fully retracted)")
-            if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
+            if is_driving_retract(servo, cfg):   # 082526
                 neutral(servo, cfg)
             return True
 
-        if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
+        if is_driving_retract(servo, cfg):   # 082526
             neutral(servo, cfg)
 
-    elif (dist < cfg["PWD_ADP_TH"]) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0):
+    elif (dist < cfg["PWD_ADP_TH"]) and is_driving_retract(servo, cfg):   # 082526
         servo.value = cfg["ROTATION_DIRECTION"] * pwr + cfg["NEUTRAL_POS"]
         logger.info("currnt adaptive pwr: %s" % servo.value)
 
@@ -742,9 +787,36 @@ def gcs_status(text, cfg=None, force=False, sev=None):
         logger.info("081426 statustext failed: %s" % e)
 
 
+def is_driving_retract(servo, cfg):
+    """082526: True if the servo is currently commanded in the retract
+    direction. neutral() now stops the pulse train, which leaves servo.value
+    as None, and None * int raises TypeError - caught by the bare except in
+    retract_adaptive() and therefore silent. Guard it in one place."""
+    v = servo.value
+    if v is None:
+        return False
+    return (cfg["ROTATION_DIRECTION"] * v) > 0.0
+
+
 def neutral(servo, cfg):
-    servo.value = cfg["NEUTRAL_POS"]
-    logger.info('inside neutral')
+    # 082526: was servo.value = NEUTRAL_POS, a continuous 1500us pulse train.
+    # That keeps the servo powered and commanded whenever the winch is idle:
+    # between casts, through the bottom pause, and for the whole time the
+    # script runs with no mission. Bench measurement showed a damaged unit
+    # dissipating ~12 W in that state while a healthy one drew nothing
+    # measurable, and the servo runs cool whenever the pulses stop.
+    # servo.value = None stops the pulse train, which is exactly the state the
+    # servo is in when this script is not running. Safe here because the
+    # payload holds position with the drone powered down, i.e. with no signal.
+    #
+    # The simulator keeps the old behaviour: ServoSim/LinkedHallADC read
+    # servo.value to model the winch, and None is not a value they expect.
+    if adc_sim_flag == 1:
+        servo.value = cfg["NEUTRAL_POS"]
+        logger.info('inside neutral (sim, holding neutral value)')
+    else:
+        servo.value = None
+        logger.info('inside neutral (pulses stopped)')
 
 def broadcast_value(x, n):
     return [] if n <= 0 else [x] * n
@@ -1107,9 +1179,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
     if "failed" not in sensor_state:
         sensor_state["failed"] = load_buffer(BUFFER_PATH)
 
-    logger.info("082426: LATCH-RELEASE build - release ends on Hall "
-                "(dist > RETRACT_TH=%s), RELEASE_SEC is a backstop only"
-                % wParms["RETRACT_TH"])
+    logger.info("082526: LATCH-RELEASE build - %d pulses of %.2fs at "
+                "RELEASE_PWR, servo off between, ends on Hall dist > %s; "
+                "RELEASE_SEC is an overall backstop"
+                % (wParms["LATCH_TRIES"], wParms["LATCH_PULSE_SEC"],
+                   wParms["RETRACT_TH"]))
     logger.info("MAVLINK: starting on FC link %s @ %s" % (FC_CONN_STR, FC_BAUD))
 
     try:

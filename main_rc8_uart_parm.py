@@ -555,14 +555,14 @@ def retract_adaptive(servo, adc, cfg, st):
             st["RETRACTED"] = 1
             fsm_st["deploy_allowed"] = True
             logger.info("Deploy re-enabled (fully retracted)")
-            if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
+            if is_driving_retract(servo, cfg):   # 082526
                 neutral(servo, cfg)
             return True
 
-        if (cfg["ROTATION_DIRECTION"] * servo.value) > 0.0:
+        if is_driving_retract(servo, cfg):   # 082526
             neutral(servo, cfg)
 
-    elif (dist < cfg["PWD_ADP_TH"]) and ((cfg["ROTATION_DIRECTION"] * servo.value) > 0.0):
+    elif (dist < cfg["PWD_ADP_TH"]) and is_driving_retract(servo, cfg):   # 082526
         servo.value = cfg["ROTATION_DIRECTION"] * pwr + cfg["NEUTRAL_POS"]
         logger.info("currnt adaptive pwr: %s" % servo.value)
 
@@ -700,9 +700,36 @@ def gcs_status(text, cfg=None, force=False, sev=None):
         logger.info("081426 statustext failed: %s" % e)
 
 
+def is_driving_retract(servo, cfg):
+    """082526: True if the servo is currently commanded in the retract
+    direction. neutral() now stops the pulse train, which leaves servo.value
+    as None, and None * int raises TypeError - caught by the bare except in
+    retract_adaptive() and therefore silent. Guard it in one place."""
+    v = servo.value
+    if v is None:
+        return False
+    return (cfg["ROTATION_DIRECTION"] * v) > 0.0
+
+
 def neutral(servo, cfg):
-    servo.value = cfg["NEUTRAL_POS"]
-    logger.info('inside neutral')
+    # 082526: was servo.value = NEUTRAL_POS, a continuous 1500us pulse train.
+    # That keeps the servo powered and commanded whenever the winch is idle:
+    # between casts, through the bottom pause, and for the whole time the
+    # script runs with no mission. Bench measurement showed a damaged unit
+    # dissipating ~12 W in that state while a healthy one drew nothing
+    # measurable, and the servo runs cool whenever the pulses stop.
+    # servo.value = None stops the pulse train, which is exactly the state the
+    # servo is in when this script is not running. Safe here because the
+    # payload holds position with the drone powered down, i.e. with no signal.
+    #
+    # The simulator keeps the old behaviour: ServoSim/LinkedHallADC read
+    # servo.value to model the winch, and None is not a value they expect.
+    if adc_sim_flag == 1:
+        servo.value = cfg["NEUTRAL_POS"]
+        logger.info('inside neutral (sim, holding neutral value)')
+    else:
+        servo.value = None
+        logger.info('inside neutral (pulses stopped)')
 
 def broadcast_value(x, n):
     return [] if n <= 0 else [x] * n
