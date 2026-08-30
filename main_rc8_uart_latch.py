@@ -27,9 +27,26 @@ from bt_helper import *
 
 from adc_sim import ServoSim, LinkedHallADC
 
+# 083026: fault injector. Subclasses LinkedHallADC and blocks motion at chosen
+# moments, so the REAL code paths run: release_win() exhausts its latch pulses,
+# retract runs to its timeout, the ADC except branches fire. Imported guarded
+# so a Pi without the file still runs normally on adc_sim_flag alone.
+try:
+    from adc_sim_faults import FaultyHallADC
+except ImportError:
+    FaultyHallADC = None
+
 # simulator flags
 data_sim_flag = False
 adc_sim_flag = 1
+# 083026: 1 = inject faults into the simulated Hall. Requires adc_sim_flag = 1;
+# ignored on real hardware. Tunables below apply only when this is 1.
+adc_fault_flag = 0
+adc_fault_rate = 0.35      # fraction of casts that get a fault (1.0 = every cast)
+adc_fault_type = None      # None = draw at random; or "latch_stuck",
+                           # "slow_latch", "retract_jam", "sensor_fault",
+                           # "sensor_stuck"
+adc_fault_seed = None      # set an int to make a run reproducible
 
 COPTER_MODES = {
     0: "STABILIZE",
@@ -841,7 +858,13 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
     try:
         if adc_sim_flag == 1:
-            adc = LinkedHallADC(
+            # 083026: same arguments either way; FaultyHallADC only adds the
+            # injection on top. retracted_val/extended_val must match the servo
+            # being modelled - these are the OLD magnet. The current unit reads
+            # ~7000 retracted, so update these and HALL_TARGET/RETRACT_TH
+            # together or the sim will show timeouts that are an artifact of
+            # the mismatch rather than of the code.
+            sim_args = dict(
                 servo=servo,
                 retracted_val=1035,
                 extended_val=12285,
@@ -852,6 +875,19 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 noise=5,
                 start_at="retracted",
             )
+            if adc_fault_flag == 1 and FaultyHallADC is not None:
+                adc = FaultyHallADC(
+                    fault_rate=adc_fault_rate,
+                    fault=adc_fault_type,
+                    seed=adc_fault_seed,
+                    logger=logger,
+                    **sim_args
+                )
+            else:
+                if adc_fault_flag == 1:
+                    logger.info("adc_fault_flag set but adc_sim_faults.py not "
+                                "importable - running the plain simulator")
+                adc = LinkedHallADC(**sim_args)
         else:
             i2c = busio.I2C(board.SCL, board.SDA)
             ads = ADS.ADS1115(i2c)
@@ -929,6 +965,13 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
     finally:
         neutral(servo, cfg)
+        # 083026: stall seconds and modelled wear for the session. Only the
+        # fault injector reports these; the plain simulator has no summary().
+        try:
+            if hasattr(adc, "summary"):
+                logger.info(adc.summary())
+        except Exception as e:
+            logger.info("fault sim summary failed: %s" % e)
         time.sleep(0.1)
 
 def cache_sample_csv(cols, cache_dir=CACHE_DIR):
@@ -1464,6 +1507,11 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     logging.info("adc_sim_flag: %s" % adc_sim_flag)
+    # 083026
+    if adc_sim_flag == 1 and adc_fault_flag == 1:
+        logging.info("adc_fault_flag: 1  rate=%s type=%s seed=%s"
+                     % (adc_fault_rate, adc_fault_type or "random",
+                        adc_fault_seed))
     stop_evt = threading.Event()
     q_winch = queue.Queue()
     q_ble = queue.Queue()
