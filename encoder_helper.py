@@ -45,7 +45,12 @@ SCALE = 32          # fallback for any var_id not listed
 SCALE_MAP = {
     0: 1,      # time           sample index, integer
     1: 100,    # DO             0.01 ratio, matches the sensor's own 2 dp
-    2: 32,     # temp           0.031 C; 64 would clip on observed 2.07 C spread
+    2: 8,      # temp           0.125 C, +/-15.9 C from the chunk mean.
+               # 083026: was 32 (+/-3.97 C), sized on the 2.07 C worst case
+               # from the BP2 casts. A stratified pond can span 10-15 C in one
+               # cast, which clips at 32 - and build_frames only reports that
+               # with print(), so it would not appear in the log. 0.125 C is
+               # still finer than the probe's thermistor resolves.
     3: 100,    # pressure       0.01 hPa = 0.004 in   (int16, see WIDTH_MAP)
     4: 32,     # init_DO        constant per cast, base captures it
     5: 100,    # init_pressure  0.01 hPa; scale 1 was discarding the decimals
