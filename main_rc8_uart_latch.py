@@ -1082,8 +1082,14 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                 _n = int(s_size[1])
                             except Exception:
                                 _n = -1
+                            # 083026: was wincfg, which is mav_thread's name for
+                            # the wParms dict and does not exist in ble_thread.
+                            # The NameError was raised while evaluating the
+                            # argument, before gcs_status ran, and unwound the
+                            # whole fetch handler below - no CSV cached, no
+                            # upload queued, on every cast that reached here.
                             gcs_status("CAST COMPLETE, %d samples" % _n,
-                                       wincfg, force=True)
+                                       wParms, force=True)
                             do_list = ble.sdata.get("do_vals") or []
                             if ok and len(do_list) > 0:
                                 temp_list = ble.sdata.get("temp_vals") or []
@@ -1126,8 +1132,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             else:
                                 st["c_status"] = "fetch_empty"
                                 logger.info("BLE fetch returned no samples; upload skipped")
-                                gcs_status("CAST COMPLETE but 0 samples", wincfg,
-                                           force=True, sev=SEV_ALERT)
+                                gcs_status("CAST COMPLETE but 0 samples", wParms,
+                                           force=True, sev=SEV_ALERT)   # 083026
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
                             logger.info("fetch failed: %s" % e)
