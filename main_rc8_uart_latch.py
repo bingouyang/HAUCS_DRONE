@@ -36,6 +36,15 @@ try:
 except ImportError:
     FaultyHallADC = None
 
+# ---- Script version -------------------------------------------------------
+# 083026: single place to confirm which build is running. Logged at startup, so
+# the head of logs/cc_*.log identifies it without grepping for change markers.
+# Bump the trailing number on any deploy; change the date on a new day's work.
+#   latch-083026.1   wincfg NameError fixed in ble_thread (was discarding every
+#                    fetched cast), frame-count var_id lookup fixed, fault
+#                    injector wired in behind adc_fault_flag
+SCRIPT_VERSION = "latch-083026.1"
+
 # simulator flags
 data_sim_flag = True
 adc_sim_flag = 1
@@ -1517,6 +1526,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    logging.info("SCRIPT_VERSION: %s" % SCRIPT_VERSION)          # 083026
+    try:                                                          # 083026
+        logging.info("wire contract: %s" % contract_id())
+    except Exception as e:
+        logging.info("wire contract: unavailable (%s)" % e)
     logging.info("adc_sim_flag: %s" % adc_sim_flag)
     # 083026
     if adc_sim_flag == 1 and adc_fault_flag == 1:

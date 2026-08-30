@@ -27,6 +27,15 @@ from bt_helper import *
 
 from adc_sim import ServoSim, LinkedHallADC
 
+# ---- Script version -------------------------------------------------------
+# 083026: single place to confirm which build is running. Logged at startup, so
+# the head of logs/cc_*.log identifies it without grepping for change markers.
+# Bump the trailing number on any deploy; change the date on a new day's work.
+#   latch-083026.1   wincfg NameError fixed in ble_thread (was discarding every
+#                    fetched cast), frame-count var_id lookup fixed, fault
+#                    injector wired in behind adc_fault_flag
+SCRIPT_VERSION = "direct-083026.1"
+
 # simulator flags
 data_sim_flag = False
 adc_sim_flag = 0
@@ -595,8 +604,13 @@ def send_payload_reported(link, cols, state, cfg):
             vals = cols.get(name) or []
             if not vals:
                 continue
-            width = max_samples(VAR_MAP[name]) if "VAR_MAP" in globals() \
-                else max_samples(SEND_ORDER.index(name))
+            # 083026: was preferring VAR_MAP[name], but encoder_helper's
+            # VAR_MAP is a column template of empty lists ({"DO": [], ...})
+            # that only defines SEND_ORDER - the name->id map lives in
+            # sampling_helper on the GCS side. int([]) raised, and the whole
+            # count was lost. prepare_per_var_queues() derives the id this way,
+            # so match it.
+            width = max_samples(SEND_ORDER.index(name))
             n_frames += (len(vals) + width - 1) // width
             if name == "DO":
                 n_samples = len(vals)
@@ -1377,6 +1391,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    logging.info("SCRIPT_VERSION: %s" % SCRIPT_VERSION)          # 083026
+    try:                                                          # 083026
+        logging.info("wire contract: %s" % contract_id())
+    except Exception as e:
+        logging.info("wire contract: unavailable (%s)" % e)
     logging.info("adc_sim_flag: %s" % adc_sim_flag)
     stop_evt = threading.Event()
     q_winch = queue.Queue()

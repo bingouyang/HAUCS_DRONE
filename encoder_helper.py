@@ -74,6 +74,30 @@ def residue_limits(var_id):
 def max_samples(var_id):
     return (DATA_BYTES - HDR_LEN) // residue_width(var_id)
 
+# ---- Wire contract version ------------------------------------------------
+# 083026: the encoder and decoder each look SCALE_MAP up locally; nothing about
+# the coding is carried in the frame. A one-sided deploy therefore decodes to
+# plausible wrong numbers with no error anywhere. This makes the contract
+# explicit so both sides log it and a mismatch is visible after the fact.
+#
+# BUMP WIRE_VERSION whenever any of these change:
+#   SCALE_MAP, WIDTH_MAP, SEND_ORDER, HDR_LEN / HDR_FMT, DATA_BYTES
+# and deploy encoder_helper.py (Pi) and sampling_helper.py (GCS) together.
+#
+#   1  083026  9-byte header with chunk_idx; temp scale 8, pressure int16/100
+#
+# contract_id() also hashes the actual values, so a forgotten bump still shows
+# as a differing hash even when the version numbers agree.
+WIRE_VERSION = 1
+
+
+def contract_id():
+    import hashlib, json
+    c = {"SCALE": SCALE, "SCALE_MAP": SCALE_MAP, "WIDTH_MAP": WIDTH_MAP,
+         "HDR_LEN": HDR_LEN, "DATA_BYTES": DATA_BYTES, "SEND_ORDER": SEND_ORDER}
+    h = hashlib.sha256(json.dumps(c, sort_keys=True).encode()).hexdigest()[:8]
+    return "v%d/%s" % (WIRE_VERSION, h)
+
 # set or read the two high bits in var_len (payload[7])
 FLAG_NONE = 0
 FLAG_EOF  = 1  # end of frame
