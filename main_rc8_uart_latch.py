@@ -43,7 +43,8 @@ except ImportError:
 #   latch-083026.1   wincfg NameError fixed in ble_thread (was discarding every
 #                    fetched cast), frame-count var_id lookup fixed, fault
 #                    injector wired in behind adc_fault_flag
-SCRIPT_VERSION = "latch-083026.1"
+#   latch-083026.2   wire contract v2 (FRAME_END scale)
+SCRIPT_VERSION = "latch-083026.2"
 
 # simulator flags
 data_sim_flag = True

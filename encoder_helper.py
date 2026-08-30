@@ -55,6 +55,12 @@ SCALE_MAP = {
     4: 32,     # init_DO        constant per cast, base captures it
     5: 100,    # init_pressure  0.01 hPa; scale 1 was discarding the decimals
     6: 100,    # batt_v         0.01 V
+    127: 1,    # FRAME_END      083026: control marker, payload is list(b"CONTROL").
+               # Not listed before, so it fell back to SCALE=32 and clipped 3 of
+               # 7 residues on every cast. The receiver ignores this payload, so
+               # the values never mattered - but the warning printed each time
+               # and would mask a real clipping report. Scale 1 fits the ASCII
+               # spread with room over.
 }
 
 # Residue width in bytes. Anything not listed is 1 (int8).
@@ -85,10 +91,12 @@ def max_samples(var_id):
 # and deploy encoder_helper.py (Pi) and sampling_helper.py (GCS) together.
 #
 #   1  083026  9-byte header with chunk_idx; temp scale 8, pressure int16/100
+#   2  083026  FRAME_END (var 127) given scale 1; was falling back to 32
+#               and clipping its control payload on every cast
 #
 # contract_id() also hashes the actual values, so a forgotten bump still shows
 # as a differing hash even when the version numbers agree.
-WIRE_VERSION = 1
+WIRE_VERSION = 2
 
 
 def contract_id():
