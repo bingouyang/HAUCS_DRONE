@@ -37,7 +37,7 @@ except ImportError:
     FaultyHallADC = None
 
 # simulator flags
-data_sim_flag = False
+data_sim_flag = True
 adc_sim_flag = 1
 # 083026: 1 = inject faults into the simulated Hall. Requires adc_sim_flag = 1;
 # ignored on real hardware. Tunables below apply only when this is 1.
@@ -699,8 +699,13 @@ def send_payload_reported(link, cols, state, cfg):
             vals = cols.get(name) or []
             if not vals:
                 continue
-            width = max_samples(VAR_MAP[name]) if "VAR_MAP" in globals() \
-                else max_samples(SEND_ORDER.index(name))
+            # 083026: was preferring VAR_MAP[name], but encoder_helper's
+            # VAR_MAP is a column template of empty lists ({"DO": [], ...})
+            # that only defines SEND_ORDER - the name->id map lives in
+            # sampling_helper on the GCS side. int([]) raised, and the whole
+            # count was lost. prepare_per_var_queues() derives the id this way,
+            # so match it.
+            width = max_samples(SEND_ORDER.index(name))
             n_frames += (len(vals) + width - 1) // width
             if name == "DO":
                 n_samples = len(vals)
