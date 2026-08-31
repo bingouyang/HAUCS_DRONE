@@ -59,7 +59,9 @@ except ImportError:
 #                     the latch build, so both simulate identically
 #   direct-083026.5   HEARTBEAT latch filtered to the real autopilot; was
 #                     locking onto the GCS heartbeat forwarded by the Cube
-SCRIPT_VERSION = "direct-083026.5"
+#   direct-083026.6   rail polled continuously in winch_thread, so V/A are
+#                     live between casts and not just during one
+SCRIPT_VERSION = "direct-083026.6"
 
 # simulator flags
 data_sim_flag = False
@@ -1061,6 +1063,17 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 cmd = q_winch.get(timeout=0.25)
             except queue.Empty:
                 cmd = None
+
+            # 083026: poll the rail every pass, not only during a cast.
+            # ina_poll() is also called from hall_raw(), but hall_raw() only
+            # runs inside release_win()/retract_adaptive(), so between casts
+            # the cached voltage and current went stale and the HUD showed
+            # numbers from the last cast. This loop turns over continuously
+            # (0.25 s queue timeout), so idle draw, a rail collapse, or a
+            # servo drawing current when nothing commanded it are all visible
+            # while the winch is sitting still. The helper rate-limits itself,
+            # so this costs a comparison on most passes.
+            ina_poll(wParms)
 
             if cmd:
                 act = (cmd.get("action") or "").upper()
