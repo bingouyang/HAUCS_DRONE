@@ -56,14 +56,16 @@ except ImportError:
 #   latch-083026.2   wire contract v2 (FRAME_END scale)
 #   latch-083026.3    INA226 rail monitoring (WVOLT/WAMP/WPKA) and the HAUCS
 #                     numeric status code on the Mission Planner HUD
-SCRIPT_VERSION = "latch-083026.3"
+#   latch-083026.4    ina_sim=True reaches FaultyHallADC; HEARTBEAT latch
+#                     filtered to the real autopilot (was locking onto the GCS)
+SCRIPT_VERSION = "latch-083026.4"
 
 # simulator flags
 data_sim_flag = True
 adc_sim_flag = 1
 # 083026: 1 = inject faults into the simulated Hall. Requires adc_sim_flag = 1;
 # ignored on real hardware. Tunables below apply only when this is 1.
-adc_fault_flag = 0
+adc_fault_flag = 1
 adc_fault_rate = 0.35      # fraction of casts that get a fault (1.0 = every cast)
 adc_fault_type = None      # None = draw at random; or "latch_stuck",
                            # "slow_latch", "retract_jam", "sensor_fault",
@@ -1078,13 +1080,22 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 start_at="retracted",
             )
             if adc_fault_flag == 1 and FaultyHallADC is not None:
-                adc = FaultyHallADC(
-                    fault_rate=adc_fault_rate,
-                    fault=adc_fault_type,
-                    seed=adc_fault_seed,
-                    logger=logger,
-                    **sim_args
-                )
+                # 083026: ina_sim=True asks FaultyHallADC for its simulated
+                # rail, so the HUD current/voltage fields work in simulation.
+                # Older copies of adc_sim_faults.py do not accept the keyword
+                # and would raise TypeError here, which the enclosing except
+                # turns into "ADS1115 init failed" and kills winch_thread
+                # outright. Retry without it rather than lose the winch.
+                fault_args = dict(fault_rate=adc_fault_rate,
+                                  fault=adc_fault_type,
+                                  seed=adc_fault_seed,
+                                  logger=logger)
+                try:
+                    adc = FaultyHallADC(ina_sim=True, **fault_args, **sim_args)
+                except TypeError:
+                    logger.info("083026 adc_sim_faults.py predates ina_sim; "
+                                "simulated rail unavailable, update that file")
+                    adc = FaultyHallADC(**fault_args, **sim_args)
             else:
                 if adc_fault_flag == 1:
                     logger.info("adc_fault_flag set but adc_sim_faults.py not "
@@ -1483,7 +1494,34 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                                   source_component=191)
 
         logger.info("MAVLINK: waiting for HEARTBEAT from Cube...")
-        hb = m_fc.wait_heartbeat(timeout=10)
+        # 083026: wait_heartbeat() takes the FIRST heartbeat on the link, and
+        # the Cube forwards the GCS's own heartbeat down to us, so this used to
+        # latch sys=255 comp=230 (MAVProxy) instead of sys=1 comp=1 (the
+        # autopilot). Everything keyed off target_system/target_component then
+        # pointed at the GCS: SET_MESSAGE_INTERVAL went to the wrong place, and
+        # the HEARTBEAT filter in the loop below accepted only GCS heartbeats,
+        # so flight mode was read from a packet whose custom_mode is always 0
+        # and auto_mode could never become True. Skip GCS-type heartbeats and
+        # anything without a real autopilot.
+        hb = None
+        _hb_deadline = time.time() + 10.0
+        _hb_skipped = []
+        while time.time() < _hb_deadline:
+            _m = m_fc.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+            if _m is None:
+                continue
+            if (_m.type == mavutil.mavlink.MAV_TYPE_GCS or
+                    _m.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID):
+                _sig = (_m.get_srcSystem(), _m.get_srcComponent())
+                if _sig not in _hb_skipped:
+                    _hb_skipped.append(_sig)
+                    logger.info("MAVLINK: ignoring non-autopilot HEARTBEAT "
+                                "sys=%s comp=%s" % _sig)
+                continue
+            hb = _m
+            m_fc.target_system = _m.get_srcSystem()
+            m_fc.target_component = _m.get_srcComponent()
+            break
 
         if not hb:
             logger.info("MAVLINK: no HEARTBEAT in 10s (check UART wiring, baud, serial port)")
