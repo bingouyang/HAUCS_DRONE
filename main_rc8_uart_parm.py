@@ -27,6 +27,15 @@ from bt_helper import *
 
 from adc_sim import ServoSim, LinkedHallADC
 
+# 083026: rail monitoring. Guarded so a missing ina_helper.py or smbus2 leaves
+# the winch fully functional with the current feature simply switched off.
+try:
+    from ina_helper import INA226
+    _INA_IMPORT_ERR = None
+except Exception as _e:          # pragma: no cover
+    INA226 = None
+    _INA_IMPORT_ERR = _e
+
 # ---- Script version -------------------------------------------------------
 # 083026: single place to confirm which build is running. Logged at startup, so
 # the head of logs/cc_*.log identifies it without grepping for change markers.
@@ -35,7 +44,9 @@ from adc_sim import ServoSim, LinkedHallADC
 #                    fetched cast), frame-count var_id lookup fixed, fault
 #                    injector wired in behind adc_fault_flag
 #   direct-083026.2   wire contract v2 (FRAME_END scale)
-SCRIPT_VERSION = "direct-083026.2"
+#   direct-083026.3   INA226 rail monitoring (WVOLT/WAMP/WPKA) and the HAUCS
+#                     numeric status code on the Mission Planner HUD
+SCRIPT_VERSION = "direct-083026.3"
 
 # simulator flags
 data_sim_flag = False
@@ -128,6 +139,20 @@ wParms = {
     "PWD_ADP_TH": 10000,
     "LOG_PREFIX": "[WINCH] ",
     "PAUSE_SEC": 2,         # 071426: idle at bottom before retract; overridden by SCR_USER2
+    # 083026: INA226 rail monitoring on the Pi I2C bus, alongside the ADS1115.
+    # INA_ENABLE 0 disables every part of it; nothing else changes.
+    "INA_ENABLE": 1,
+    "INA_ADDR": 0x44,
+    "INA_SHUNT_OHM": 0.009091,  # R100 || R010; re-measure in place and update
+    "INA_AVG": 16,              # 35 ms conversion
+    "INA_POLL_HZ": 20.0,        # polled next to every Hall read
+    "INA_HUD_HZ": 2.0,          # WVOLT / WAMP to the GCS
+    # Current above this while the servo is driving means the mechanism is not
+    # moving. Reported only - nothing is aborted on it. Healthy free-running
+    # draw measured 0.15 A, the worn bench unit 0.60 A, and the MP1584 limits
+    # around 3 A, so 1.5 A is clear of normal and below the converter ceiling.
+    "INA_STALL_A": 1.5,
+    "INA_STALL_SEC": 0.75,      # sustained for this long before it is reported
     "RETRACT_SEC": 35,      # 071426: motor drives payload up; overridden by SCR_USER3
 }
 
@@ -350,6 +375,13 @@ def process_statustext(txt, st):
         st["awaiting_final_td"] = True
 
 def hall_raw(c):
+    # 083026: the rail is polled here so voltage and current are sampled within
+    # milliseconds of the Hall value. That adjacency is the point: Hall frozen
+    # with normal current is a dead sensor, Hall frozen with stall current is a
+    # real jam, and the two are indistinguishable if the reads drift apart.
+    # The helper rate-limits internally, so calling it from this hot path costs
+    # a comparison on most passes.
+    ina_poll(wParms)
     if adc_sim_flag == 1:
         return int(c.read())
     else:
@@ -392,8 +424,8 @@ def release_win(servo, adc, cfg, st, stop_evt):
             hall_start = hall_median(adc)
 
             if not recovered and hall_start > cfg["RETRACT_TH"]:
-                gcs_status("ABORT release, line stuck out", cfg, force=True,
-                           sev=SEV_ALERT)
+                haucs_code(8, "ABORT release, line stuck out", cfg,
+                           sev=SEV_ALERT)                    # 083026
                 logger.info("SAFETY ABORT: recovery retract did not clear in %.0fs "
                             "(hall still %d). Aborting release."
                             % (RECOVERY_SEC, hall_start))
@@ -415,8 +447,15 @@ def release_win(servo, adc, cfg, st, stop_evt):
     svalue = cfg["ROTATION_DIRECTION"] * (cfg["RELEASE_PWR"]) + cfg["NEUTRAL_POS"]
     t0 = time.time()
     logger.info("Release, winch servo open: %s, duration: %ss" % (svalue, cfg["RELEASE_SEC"]))
-    gcs_status("release %.0fs, sampling started" % cfg["RELEASE_SEC"], cfg, force=True)
+    # 083026: new cast. Reset the peak so WPKA reports this cast, not the last.
+    if _ina["dev"] is not None:
+        try:
+            _ina["dev"].reset_peaks()
+        except Exception:
+            pass
+    haucs_code(1, "release %.0fs, sampling started" % cfg["RELEASE_SEC"], cfg)
     servo.value = float(svalue)
+    haucs_code(2)                                            # 083026 descending
 
     while not stop_evt.is_set():
         if (time.time() - t0) > cfg["RELEASE_SEC"]:
@@ -525,6 +564,7 @@ def retract_stepped(servo, adc, cfg, st, stop_evt, dur):
             time.sleep(0.05)
 
     logger.info("081426 stepped: timeout after %d stages" % step)
+    haucs_code(9)                                            # 083026
     gcs_status("ascent timeout %d stages" % step, cfg, force=True,
                sev=SEV_ALERT)
     return False
@@ -539,6 +579,7 @@ def retract_adaptive(servo, adc, cfg, st):
     # prevented at the servo, whose polarity-flip flag is disabled, so the
     # _hall_start baseline and its SAFETY ABORT are no longer needed.
     except Exception:
+        haucs_code(10, None, cfg)                            # 083026 hall read failed
         neutral(servo, cfg)
         time.sleep(0.25)
         return False
@@ -587,6 +628,147 @@ def retract_adaptive(servo, adc, cfg, st):
 # these land in the message pane and can never displace a real warning.
 # Rate limited, and capped at the 50 byte STATUSTEXT payload.
 _status = {"link": None, "last": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# 083026: numeric status code on the HUD.
+#
+# NAMED_VALUE_FLOAT reaches both Mission Planner's HUD user items and the Quick
+# tab, and MP holds the last value it received, so the number stays on screen.
+# STATUSTEXT does not persist, which is why the code goes on this channel and
+# the wording stays in the Messages tab.
+#
+# Under 8 is normal progress, 8 and above is a fault: one rule for the operator.
+HAUCS_CODES = {
+    0:  "idle",
+    1:  "release commanded",
+    2:  "payload descending",
+    3:  "sampling at depth",
+    4:  "retract running",
+    5:  "cast complete, transmitting",
+    8:  "LATCH/RELEASE FAILED",
+    9:  "RETRACT TIMEOUT",
+    10: "SENSOR FAULT",
+    11: "NO SAMPLES",
+    12: "OVERCURRENT / STALL",
+}
+
+HAUCS_FIELD = b"HAUCS"          # NAMED_VALUE_FLOAT names are capped at 10 bytes
+
+# code   last value sent, resent at HAUCS_REPEAT_S so a dropped packet cannot
+#        leave a stale number on the operator's screen
+_hstat = {"code": 0, "last_send": 0.0}
+HAUCS_REPEAT_S = 1.0
+
+
+def _named_float(m, name, value):
+    """One NAMED_VALUE_FLOAT. Never raises."""
+    try:
+        m.mav.named_value_float_send(
+            int(time.time() * 1000) & 0xFFFFFFFF, name, float(value))
+        return True
+    except Exception as e:
+        logger.info("083026 named_value_float %s failed: %s" % (name, e))
+        return False
+
+
+def haucs_code(code, detail=None, cfg=None, sev=None):
+    """Set the HUD status code. Sends immediately on a change and lets
+    haucs_tick() keep it alive. detail, if given, goes to the Messages tab
+    through the existing gcs_status path."""
+    m = _status["link"]
+    changed = (code != _hstat["code"])
+    _hstat["code"] = int(code)
+    if m is not None:
+        _named_float(m, HAUCS_FIELD, code)
+        _hstat["last_send"] = time.time()
+    if changed:
+        logger.info("HAUCS code %d (%s)" % (code, HAUCS_CODES.get(code, "?")))
+    if detail:
+        gcs_status(detail, cfg, force=True, sev=sev)
+
+
+def haucs_tick(m, now=None):
+    """Resend the current code at HAUCS_REPEAT_S. Named floats are one-shot and
+    MP simply keeps the last value, so without this a single dropped packet
+    would leave the wrong number on screen until the next transition."""
+    if m is None:
+        return
+    now = now or time.time()
+    if (now - _hstat["last_send"]) < HAUCS_REPEAT_S:
+        return
+    _hstat["last_send"] = now
+    _named_float(m, HAUCS_FIELD, _hstat["code"])
+
+
+# ---------------------------------------------------------------------------
+# 083026: INA226 rail monitoring.
+#
+# One owner polls: winch_thread, via hall_raw(), so voltage and current are
+# sampled within milliseconds of the Hall value they have to be interpreted
+# against. mav_thread never calls read(); it reads the cached attributes, so
+# the two threads cannot race the helper's rate limiter or failure counter.
+_ina = {"dev": None, "stall_since": 0.0, "stall_reported": False,
+        "hud_last": 0.0}
+
+
+def set_ina(dev):
+    _ina["dev"] = dev
+
+
+def ina_poll(cfg=None):
+    """Poll the rail. Rate-limited inside the helper, so this is cheap to call
+    from the Hall path. Returns (volts, amps), or (None, None)."""
+    dev = _ina["dev"]
+    if dev is None:
+        return (None, None)
+    try:
+        v, a = dev.read()
+    except Exception as e:              # the helper guards itself; belt and braces
+        logger.info("083026 ina read raised: %s" % e)
+        return (None, None)
+    if v is None or a is None or cfg is None:
+        return (v, a)
+
+    # Sustained overcurrent while driving means the mechanism is not moving.
+    # Reported only. Nothing is aborted on it, because a false positive here
+    # would strand the winch, and the retract timeout already bounds the drive.
+    now = time.time()
+    if a >= float(cfg.get("INA_STALL_A", 1.5)):
+        if _ina["stall_since"] == 0.0:
+            _ina["stall_since"] = now
+        elif (not _ina["stall_reported"]
+              and (now - _ina["stall_since"]) >= float(cfg.get("INA_STALL_SEC", 0.75))):
+            _ina["stall_reported"] = True
+            logger.info("WARNING: winch overcurrent %.2f A at %.2f V for %.1fs "
+                        "- mechanism may be stalled"
+                        % (a, v, now - _ina["stall_since"]))
+            haucs_code(12, "STALL %.1fA %.1fV" % (a, v), cfg, sev=SEV_ALERT)
+    else:
+        _ina["stall_since"] = 0.0
+        _ina["stall_reported"] = False
+    return (v, a)
+
+
+def ina_hud_tick(m, cfg, now=None):
+    """Send WVOLT / WAMP / WPKA. Called from mav_thread's loop; sends at
+    INA_HUD_HZ regardless of how fast that loop runs. Reads cached values
+    only - no I2C from this thread."""
+    dev = _ina["dev"]
+    if m is None or dev is None or not cfg.get("INA_ENABLE", 1):
+        return
+    now = now or time.time()
+    period = 1.0 / float(cfg.get("INA_HUD_HZ", 2.0) or 2.0)
+    if (now - _ina["hud_last"]) < period:
+        return
+    _ina["hud_last"] = now
+    if not getattr(dev, "available", False) or dev.volts is None:
+        return
+    _named_float(m, b"WVOLT", dev.volts)
+    _named_float(m, b"WAMP", dev.amps)
+    # Peak accumulates at the poll rate, not this one, so a spike shorter than
+    # the send interval is still reported. Reset at the start of each cast.
+    _named_float(m, b"WPKA", dev.peak_a)
 
 
 def send_payload_reported(link, cols, state, cfg):
@@ -788,6 +970,40 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         logger.info("ADS1115 init failed: %s" % e)
         return
 
+    # 083026: rail monitor. Separate try block, and set_ina() is only reached
+    # on success, so any failure here leaves _ina["dev"] as None and every
+    # call site degrades to a no-op. The winch runs exactly as before.
+    if cfg.get("INA_ENABLE", 1):
+        try:
+            if adc_sim_flag == 1 and getattr(adc, "ina", None) is not None:
+                # FaultyHallADC(ina_sim=True) carries its own simulated rail,
+                # driven by the same blocked/not-blocked state it injects.
+                set_ina(adc.ina)
+                logger.info("083026 rail monitor: simulated")
+            elif INA226 is None:
+                logger.info("083026 rail monitor unavailable: %s" % _INA_IMPORT_ERR)
+            else:
+                # tare=True is valid here: neutral() has not run yet and the
+                # servo is not being driven, so the shunt genuinely sees zero.
+                dev = INA226(shunt_ohm=cfg["INA_SHUNT_OHM"],
+                             addr=cfg["INA_ADDR"],
+                             avg=cfg["INA_AVG"],
+                             rate_hz=cfg["INA_POLL_HZ"],
+                             tare=True)
+                if dev.available:
+                    set_ina(dev)
+                    v, a = dev.read(force=True)
+                    logger.info("083026 rail monitor ready: %.3f V, %.3f A idle, "
+                                "offset %+.1f uV, shunt %.4f ohm"
+                                % (v or 0.0, a or 0.0, dev.offset_v * 1e6,
+                                   dev.shunt_ohm))
+                else:
+                    logger.info("083026 rail monitor init failed: %s" % dev.err)
+        except Exception as e:
+            logger.info("083026 rail monitor init raised: %s" % e)
+    else:
+        logger.info("083026 rail monitor disabled (INA_ENABLE=0)")
+
     logger.info("winch ready")
     try:
         while not stop_evt.is_set():
@@ -808,6 +1024,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     pause_sec = float(cmd.get("pause", cfg["PAUSE_SEC"]))
                     retract_sec = float(cmd.get("retract_duration", cfg["RETRACT_SEC"]))
                     logger.info("Release finished. Idle at bottom for %.1f sec" % pause_sec)
+                    haucs_code(3, None, cfg)                 # 083026 at depth
 
                     if stop_evt.wait(pause_sec):
                         continue
@@ -818,6 +1035,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 elif act == "RETRACT":
                     dur = float(cmd.get("duration", 0.0))
                     logger.info("RETRACT for %ss" % dur)
+                    haucs_code(4, None, cfg)                 # 083026 retracting
                     # 081426: stepped ascent when SCR_USER5 > 0, otherwise the
                     # original continuous retract below, untouched.
                     if float(cfg.get("STEP_MOVE_SEC", 0.0)) > 0.0:
@@ -843,11 +1061,13 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
                         time.sleep(0.1)
                     if (time.time() - t0) >= dur:
+                        haucs_code(9, None, cfg)             # 083026
                         logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
                     neutral(servo, cfg)
 
                 elif act == "NEUTRAL":
                     neutral(servo, cfg)
+                    haucs_code(0, None, cfg)                 # 083026 idle
 
             time.sleep(0.1)
 
@@ -973,8 +1193,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             # argument, before gcs_status ran, and unwound the
                             # whole fetch handler below - no CSV cached, no
                             # upload queued, on every cast that reached here.
-                            gcs_status("CAST COMPLETE, %d samples" % _n,
-                                       wParms, force=True)
+                            haucs_code(5, "CAST COMPLETE, %d samples" % _n,
+                                       wParms)               # 083026
                             do_list = ble.sdata.get("do_vals") or []
                             if ok and len(do_list) > 0:
                                 temp_list = ble.sdata.get("temp_vals") or []
@@ -1017,8 +1237,8 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             else:
                                 st["c_status"] = "fetch_empty"
                                 logger.info("BLE fetch returned no samples; upload skipped")
-                                gcs_status("CAST COMPLETE but 0 samples", wParms,
-                                           force=True, sev=SEV_ALERT)   # 083026
+                                haucs_code(11, "CAST COMPLETE but 0 samples",
+                                           wParms, sev=SEV_ALERT)   # 083026
                         except Exception as e:
                             st["c_status"] = "fetch_failed"
                             logger.info("fetch failed: %s" % e)
@@ -1166,6 +1386,9 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
         # CHANGED: UART-only. Send payloads back through the flight-controller link.
         payload_link = m_fc
         set_status_link(m_fc)   # 081426: operator status to Mission Planner
+        # 083026: publish the code once so HAUCS appears in Mission Planner's
+        # HUD user-item list straight away. MP only lists names it has seen.
+        haucs_code(0, None, wincfg)
         logger.addHandler(GcsLogHandler(wincfg))
         # 071426: Store m_fc ref so fetch_scr_user_params can be called before each release.
         mav_fc_ref = m_fc
@@ -1178,6 +1401,13 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
         dbg_prev_iter_start = time.monotonic()
 
         while not stop_evt.is_set():
+
+            # 083026: HUD telemetry. Both are self-rate-limiting, so putting
+            # them at the top of the loop covers the recv_match timeout path
+            # too - the numbers keep updating even when no messages arrive.
+            _now = time.time()
+            ina_hud_tick(m_fc, wincfg, _now)
+            haucs_tick(m_fc, _now)
 
             if DEBUG_TRIGGER_TIMING:
                 iter_start = time.monotonic()

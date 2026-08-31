@@ -64,6 +64,17 @@ Choosing what goes wrong:
 
     ...and at shutdown:
         logger.info(adc.summary())
+
+083026: rail simulation. FaultyHallADC now also carries a SimINA226 that
+produces bus voltage and current matching what the servo is actually doing,
+including the stall spikes the faults above create. It implements the same
+interface as ina_helper.INA226, so the flight code can hold either one:
+
+    adc = FaultyHallADC(..., ina_sim=True)
+    ina = adc.ina                      # instead of INA226(...)
+    v, a = ina.read()
+
+Set ina_sim=False (the default) if you are not testing the current path.
 """
 
 import math
@@ -83,6 +94,166 @@ FAIL_UNITS = 180.0
 
 FRAC_LATCH = (LATCH_FORCE_N * LEVER_M * 141.6) / RATED_OZIN
 FRAC_STALL = 1.0
+
+# ---------------------------------------------------------------------------
+# 083026: rail / current model.
+#
+# Numbers are anchored to the 083026 bench log (servo_power_log.csv), taken on
+# the known-bad servo through breadboard wiring:
+#
+#   pulses stopped            0.000 A     bus 7.32 V
+#   running, cmd -0.62        0.570 A     bus 7.11 V
+#   V-vs-I fit over 107 loaded samples -> 0.81 ohm series resistance
+#
+# That 0.81 ohm is the breadboard, not the design. R_SERIES defaults to a
+# properly wired 0.10 ohm; pass r_series=0.81 to reproduce the bench log.
+#
+# I_RUN is the free-running draw at saturating command. The bench servo drew
+# 0.57 A; a healthy unit is taken as roughly a quarter of that.
+V_NOM = 7.40           # MP1584 output setpoint, no load
+R_SERIES = 0.10        # ohm, wiring + converter output impedance
+I_IDLE = 0.0           # pulses stopped: servo draws nothing
+I_HOLD = 0.05          # commanded neutral, healthy unit. A damaged unit was
+                       # measured at ~1.6 A / 12 W in exactly this state.
+I_RUN_GOOD = 0.15      # free-running, healthy
+I_RUN_WORN = 0.60      # free-running, worn/degraded (bench log)
+CMD_FULL = 0.35        # |cmd| at which running current saturates
+I_STALL = 3.5          # demand when the mechanism cannot move
+I_LIMIT = 3.0          # MP1584 rating; above this it goes constant-current
+                       # and the rail collapses
+I_NOISE = 0.004        # A rms, matches the observed +/-4.6 mA at avg=4
+INRUSH_MULT = 2.0      # transient multiplier at command onset
+INRUSH_S = 0.15        # how long that transient lasts
+
+
+class SimINA226(object):
+    """Drop-in stand-in for ina_helper.INA226, driven by the servo command and
+    the blocked/not-blocked state the fault simulator already computes.
+
+    update() is called from the ADC's own thread at rate_hz, so peaks are
+    captured at full rate even though read() is rate-limited the same way the
+    real helper is. That mirrors the real part, where the hardware keeps
+    converting between polls.
+    """
+
+    def __init__(self, v_nom=V_NOM, r_series=R_SERIES, i_run=I_RUN_GOOD,
+                 i_hold=I_HOLD, i_stall=I_STALL, i_limit=I_LIMIT,
+                 noise=I_NOISE, rate_hz=5.0, fail_after=None, rng=None):
+        """
+        i_run      free-running draw at saturating command
+        fail_after seconds after which read() starts failing, to exercise the
+                   helper's max_fail / available=False path. None = never.
+        """
+        self.v_nom = float(v_nom)
+        self.r_series = float(r_series)
+        self.i_run = float(i_run)
+        self.i_hold = float(i_hold)
+        self.i_stall = float(i_stall)
+        self.i_limit = float(i_limit)
+        self.noise = float(noise)
+        self.period = 1.0 / float(rate_hz) if rate_hz > 0 else 0.0
+        self.fail_after = fail_after
+        self._rng = rng or random.Random()
+
+        self.available = True
+        self.shunt_ohm = 0.009091     # R100 || R010, for interface parity
+        self.offset_v = 0.0
+        self.volts = self.v_nom
+        self.amps = 0.0
+        self.watts = 0.0
+        self.peak_a = 0.0
+        self.peak_w = 0.0
+        self.last_poll = 0.0
+        self.fails = 0
+        self.err = ""
+        self._t0 = time.time()
+        self._cmd = 0.0
+        self._blocked = False
+        self._cmd_since = 0.0
+        self._limiting = False
+        self._stall_a_max = 0.0
+
+    # -- driven by the simulator -------------------------------------------
+    def update(self, cmd, blocked, dt):
+        """cmd is the servo value (None or 0.0 means no drive)."""
+        now = time.time()
+        if cmd is None:
+            cmd = 0.0
+        if (cmd == 0.0) != (self._cmd == 0.0):
+            self._cmd_since = now
+        self._cmd = cmd
+        self._blocked = blocked
+
+        mag = abs(cmd)
+        if mag == 0.0:
+            demand = I_IDLE
+        elif blocked:
+            demand = self.i_stall
+        elif mag < 1e-6:
+            demand = self.i_hold
+        else:
+            demand = self.i_hold + (self.i_run - self.i_hold) * min(
+                1.0, mag / CMD_FULL)
+
+        if demand > 0.0 and (now - self._cmd_since) < INRUSH_S:
+            demand *= INRUSH_MULT
+
+        # MP1584 constant-current limit: current clamps, rail collapses
+        self._limiting = demand > self.i_limit
+        if self._limiting:
+            amps = self.i_limit
+            v_open = self.v_nom * (self.i_limit / demand)
+        else:
+            amps = demand
+            v_open = self.v_nom
+
+        amps += self._rng.gauss(0.0, self.noise)
+        volts = v_open - amps * self.r_series
+
+        self.amps = amps
+        self.volts = volts
+        self.watts = volts * amps
+        if amps > self.peak_a:
+            self.peak_a = amps
+        if self.watts > self.peak_w:
+            self.peak_w = self.watts
+        if blocked and amps > self._stall_a_max:
+            self._stall_a_max = amps
+
+    # -- ina_helper.INA226 interface ---------------------------------------
+    def read(self, force=False):
+        if self.fail_after is not None and (time.time() - self._t0) > self.fail_after:
+            self.fails += 1
+            self.err = "simulated I2C failure"
+            self.available = False
+            return (None, None)
+        if not self.available:
+            return (None, None)
+        now = time.time()
+        if not force and (now - self.last_poll) < self.period:
+            return (self.volts, self.amps)
+        self.last_poll = now
+        return (self.volts, self.amps)
+
+    def tare(self, n=32):
+        self.offset_v = 0.0
+        return 0.0
+
+    def reset_peaks(self):
+        self.peak_a = 0.0
+        self.peak_w = 0.0
+
+    def close(self):
+        self.available = False
+
+    def summary(self):
+        return ("ina sim: peak %.2f A / %.1f W, worst stall %.2f A, "
+                "converter %s"
+                % (self.peak_a, self.peak_w, self._stall_a_max,
+                   "HIT ITS %.1f A LIMIT" % self.i_limit if self._limiting
+                   or self._stall_a_max >= self.i_limit - 1e-6
+                   else "within limit"))
+
 
 # Relative likelihood once a cast has been selected for a fault.
 FAULT_NAMES = ("latch_stuck", "slow_latch", "retract_jam",
@@ -144,6 +315,26 @@ class FaultyHallADC(LinkedHallADC):
         self._counts = {}
         self._flock = threading.Lock()
 
+        # 083026: the parent starts its thread at the end of __init__ and that
+        # thread calls _effective_cmd immediately, so self.ina must exist first.
+        self.ina_sim = bool(kw.pop("ina_sim", False))
+        self.ina = None
+        if self.ina_sim:
+            self.ina = SimINA226(
+                v_nom=kw.pop("ina_v_nom", V_NOM),
+                r_series=kw.pop("ina_r_series", R_SERIES),
+                i_run=kw.pop("ina_i_run",
+                             I_RUN_WORN if kw.pop("ina_worn", False)
+                             else I_RUN_GOOD),
+                i_stall=kw.pop("ina_i_stall", I_STALL),
+                i_limit=kw.pop("ina_i_limit", I_LIMIT),
+                fail_after=kw.pop("ina_fail_after", None),
+                rng=self._rng)
+        else:
+            for k in ("ina_v_nom", "ina_r_series", "ina_i_run", "ina_worn",
+                      "ina_i_stall", "ina_i_limit", "ina_fail_after"):
+                kw.pop(k, None)
+
         super().__init__(*args, **kw)
 
         if self.jam_at is None:
@@ -158,6 +349,11 @@ class FaultyHallADC(LinkedHallADC):
             how = "random from FAULT_MIX at rate=%.2f" % self.fault_rate
         self._log("fault sim armed: %s, seed=%s, jam_at=%d"
                   % (how, seed, self.jam_at))
+        if self.ina is not None:                                   # 083026
+            self._log("ina sim armed: run=%.2f A, stall=%.2f A, "
+                      "limit=%.2f A, r_series=%.2f ohm"
+                      % (self.ina.i_run, self.ina.i_stall,
+                         self.ina.i_limit, self.ina.r_series))
 
     # ---- logging ----------------------------------------------------------
     def _log(self, msg):
@@ -243,6 +439,12 @@ class FaultyHallADC(LinkedHallADC):
                 else:
                     self._wear += (FRAC_LATCH ** WEAR_EXP) * dt
 
+        # 083026: feed the rail model. Done for every slice, including the
+        # ones with no command, so idle current and the return to idle after a
+        # stall both appear on the trace.
+        if self.ina is not None:
+            self.ina.update(c, blocked, dt)
+
         return 0.0 if blocked else c
 
     # ---- reads, so sensor faults reach the caller but not our own thread ---
@@ -272,12 +474,18 @@ class FaultyHallADC(LinkedHallADC):
                 "stall_s": round(self._stall_s, 2),
                 "wear": round(self._wear, 4),
                 "wear_pct": round(100.0 * self._wear / FAIL_UNITS, 2),
+                "peak_a": round(self.ina.peak_a, 3) if self.ina else None,
+                "peak_w": round(self.ina.peak_w, 2) if self.ina else None,
             }
 
     def summary(self):
         s = self.stats()
+        ina_txt = ""
+        if self.ina is not None:                                   # 083026
+            ina_txt = " | " + self.ina.summary()
         parts = ", ".join("%s=%d" % kv for kv in sorted(s["faults"].items()))
         return ("faultsim: %d casts, %.1fs driven of which %.1fs STALLED, "
                 "wear %.3f units (%.2f%% of modelled servo life)%s"
                 % (s["casts"], s["drive_s"], s["stall_s"], s["wear"],
-                   s["wear_pct"], (" [" + parts + "]") if parts else ""))
+                   s["wear_pct"], (" [" + parts + "]") if parts else "")
+                + ina_txt)
