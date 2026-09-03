@@ -63,8 +63,8 @@ except ImportError:
 SCRIPT_VERSION = "latch-083026.5"
 
 # simulator flags
-data_sim_flag = True
-adc_sim_flag = 1
+data_sim_flag = False
+adc_sim_flag = 0
 # 083026: 1 = inject faults into the simulated Hall. Requires adc_sim_flag = 1;
 # ignored on real hardware. Tunables below apply only when this is 1.
 adc_fault_flag = 1
@@ -142,7 +142,7 @@ wParms = {
     "HALL_MAX": 12285,
     "HALL_TARGET": 2500,
     "RETRACT_PWR": 0.1,
-    "RELEASE_PWR": -0.30,
+    "RELEASE_PWR": -0.125,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
     "RELEASE_SEC": 20,      # 071426: motor drives payload down; overridden by SCR_USER1
