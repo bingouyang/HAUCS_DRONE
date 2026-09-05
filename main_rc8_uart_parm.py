@@ -131,7 +131,7 @@ wParms = {
     "HALL_MAX": 12285,
     "HALL_TARGET": 2500,
     "RETRACT_PWR": 0.1,
-    "RELEASE_PWR": -0.30,
+    "RELEASE_PWR": -0.25,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
     "RELEASE_SEC": 20,      # 071426: motor drives payload down; overridden by SCR_USER1
