@@ -61,7 +61,9 @@ except ImportError:
 #                     locking onto the GCS heartbeat forwarded by the Cube
 #   direct-083026.6   rail polled continuously in winch_thread, so V/A are
 #                     live between casts and not just during one
-SCRIPT_VERSION = "direct-083026.6"
+#   direct-083026.7   STATUS_ALERT=0 stops the HUD flash now that HAUCS is a
+#                     Quick-window field; codes 9 and 10 gained wording
+SCRIPT_VERSION = "direct-083026.7"
 
 # simulator flags
 data_sim_flag = False
@@ -131,7 +133,7 @@ wParms = {
     "HALL_MAX": 12285,
     "HALL_TARGET": 2500,
     "RETRACT_PWR": 0.1,
-    "RELEASE_PWR": -0.25,
+    "RELEASE_PWR": -0.30,
     "NEUTRAL_POS": 0.0,
     "ROTATION_DIRECTION": -1,
     "RELEASE_SEC": 20,      # 071426: motor drives payload down; overridden by SCR_USER1
@@ -177,6 +179,11 @@ wParms = {
     # around 3 A, so 1.5 A is clear of normal and below the converter ceiling.
     "INA_STALL_A": 1.5,
     "INA_STALL_SEC": 0.75,      # sustained for this long before it is reported
+    # 083026: 1 = pilot-critical text is promoted to SEV_ALERT and flashes on
+    # the Mission Planner HUD. 0 = everything goes at INFO, so the Messages tab
+    # is unchanged but the HUD flash stops. Set 0 once HAUCS is bound to a
+    # Quick window cell, which shows the same state persistently.
+    "STATUS_ALERT": 0,
     "RETRACT_SEC": 35,      # 071426: motor drives payload up; overridden by SCR_USER3
 }
 
@@ -588,7 +595,7 @@ def retract_stepped(servo, adc, cfg, st, stop_evt, dur):
             time.sleep(0.05)
 
     logger.info("081426 stepped: timeout after %d stages" % step)
-    haucs_code(9)                                            # 083026
+    haucs_code(9, "ascent timeout %d stages" % step, cfg)     # 083026
     gcs_status("ascent timeout %d stages" % step, cfg, force=True,
                sev=SEV_ALERT)
     return False
@@ -603,7 +610,9 @@ def retract_adaptive(servo, adc, cfg, st):
     # prevented at the servo, whose polarity-flip flag is disabled, so the
     # _hall_start baseline and its SAFETY ABORT are no longer needed.
     except Exception:
-        haucs_code(10, None, cfg)                            # 083026 hall read failed
+        # 083026: was code-only. A sensor fault with no wording in the
+        # Messages tab leaves the operator a bare number to interpret.
+        haucs_code(10, "hall read failed", cfg)
         neutral(servo, cfg)
         time.sleep(0.25)
         return False
@@ -913,6 +922,15 @@ def gcs_status(text, cfg=None, force=False, sev=None):
     if not force and (now - _status["last"]) < cfg.get("STATUS_MIN_GAP", 1.0):
         return
     _status["last"] = now
+    # 083026: STATUS_ALERT=0 sends everything at INFO. The 082426 promotion to
+    # SEV_ALERT was there to get pilot-critical text onto Mission Planner's
+    # high-priority HUD line, which is where the brief yellow flash comes from.
+    # Now that HAUCS is a persistent number in the Quick window, that flash is
+    # redundant - and it was never readable anyway, rendering for well under a
+    # second from component 191. The wording still reaches the Messages tab
+    # either way; only the HUD flash goes away.
+    if sev is not None and not cfg.get("STATUS_ALERT", 1):
+        sev = None
     try:
         m.mav.statustext_send(
             sev if sev is not None else mavutil.mavlink.MAV_SEVERITY_INFO,
@@ -1124,7 +1142,8 @@ def winch_thread(stop_evt, q_winch, cfg, st):
 
                         time.sleep(0.1)
                     if (time.time() - t0) >= dur:
-                        haucs_code(9, None, cfg)             # 083026
+                        haucs_code(9, "retract timeout, not fully retracted",
+                                   cfg)                      # 083026
                         logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
                     neutral(servo, cfg)
 
