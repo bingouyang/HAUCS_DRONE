@@ -62,7 +62,9 @@ except ImportError:
 #                     live between casts and not just during one
 #   latch-083026.6    STATUS_ALERT=0 stops the HUD flash now that HAUCS is a
 #                     Quick-window field; codes 9 and 10 gained wording
-SCRIPT_VERSION = "latch-083026.6"
+#   latch-083026.7    HCLR named float from the GCS acknowledges a stuck fault
+#                     code ("haucs winch clear"). Display only.
+SCRIPT_VERSION = "latch-083026.7"
 
 # simulator flags
 data_sim_flag = True
@@ -1634,7 +1636,10 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             # AUTO mode: process only SERVO_OUTPUT_RAW from mission DO_SET_SERVO.
             # Non-AUTO modes: process only RC_CHANNELS from the manual radio.
             msg = m_fc.recv_match(
-                type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "GLOBAL_POSITION_INT"],
+                # 083026: NAMED_VALUE_FLOAT added so the GCS can acknowledge a
+                # fault code. See the HCLR handler below.
+                type=["HEARTBEAT", "RC_CHANNELS", "SERVO_OUTPUT_RAW",
+                      "GLOBAL_POSITION_INT", "NAMED_VALUE_FLOAT"],
                 blocking=True,
                 timeout=2,
             )
@@ -1661,6 +1666,25 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 logger.info("No HEARTBEAT, RC_CHANNELS, or SERVO_OUTPUT_RAW message received...")
             else:
                 msg_type = msg.get_type()
+
+                # 083026: fault acknowledgement from the GCS ("haucs winch
+                # clear"). A fault code sticks until the next cast so it cannot
+                # scroll past unseen, which leaves a reviewed fault sitting on
+                # the HUD looking live. This clears the DISPLAY only: it resets
+                # the reported code to 0 and touches nothing on the winch, so
+                # it can never move hardware. The next real event overwrites it
+                # immediately, so acknowledging a fault that is still happening
+                # does not hide it.
+                if msg_type == "NAMED_VALUE_FLOAT":
+                    try:
+                        if str(msg.name).rstrip("\x00").strip() == "HCLR":
+                            if _hstat["code"] != 0:
+                                logger.info("083026 GCS cleared HAUCS code %d"
+                                            % _hstat["code"])
+                            haucs_code(0, None, wincfg)
+                    except Exception as e:
+                        logger.info("083026 HCLR handler: %s" % e)
+                    continue
 
                 if msg_type == "HEARTBEAT":
                     # Ignore heartbeats from a GCS or another MAVLink component.
