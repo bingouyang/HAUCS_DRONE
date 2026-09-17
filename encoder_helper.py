@@ -11,6 +11,30 @@ HEARTBEAT_RATE=1.0
 
 # payload and header for encoding
 DATA_BYTES = 96
+# 091726: inter-frame pacing.
+#
+# A 155-sample cast is 17 frames and went out in 606 ms -- about 3.1 kB/s of
+# DATA96 on top of the normal telemetry streams. A SiK radio at 57600 delivers
+# roughly 4 kB/s in total after ECC and duty cycling, so that burst sat at or
+# over the link's capacity and one frame (temp chunk 0, seq 4) was dropped.
+# The loss happened at two feet, which rules out range: it was buffer pressure,
+# not RF.
+#
+# data96_send() only queues into the serial buffer, so send_packet() cannot
+# see congestion -- it returns True either way. Pacing is therefore the only
+# defence available here.
+#
+#   gap     DATA96 throughput     17 frames      74 frames (5x data)
+#   25 ms     4400 B/s              0.43 s          1.85 s
+#   50 ms     2200 B/s              0.85 s          3.70 s
+#   75 ms     1467 B/s              1.27 s          5.55 s
+#  100 ms     1100 B/s              1.70 s          7.40 s
+#
+# 75 ms keeps DATA96 near a third of the link and still finishes a 5x cast in
+# 5.6 s, well inside the GCS's 20 s DATA96 grace window. Raise it if the link
+# is shared harder; lower it only with evidence.
+SEND_GAP_S = 0.075
+
 # 081326: header grew by one byte for chunk_idx. Frames previously carried no
 # position, so a single lost DATA96 packet made the receiver concatenate the
 # survivors at the wrong offsets - the arrays came out short AND mispaired,
@@ -329,9 +353,14 @@ def buffer_all_remaining(per_var, failed, path="outbox.json"):
     return failed
 
 def send_packet(m, var_type, payload_bytes, seq_id):
+    # 091726: the pacing sleep lives here rather than in the send loops so
+    # every path is covered by one change -- live sends, FRAME_END, and
+    # resend_buffer() replay all funnel through this function.
     try:
         set_var_byte_resend(payload_bytes, False)  # live send flag off
         m.mav.data96_send(var_type, len(payload_bytes), bytes(payload_bytes))
+        if SEND_GAP_S > 0:
+            time.sleep(SEND_GAP_S)
         return True
     except Exception:
         print(f"Pi send error seq {seq_id} buffering all remaining")
@@ -385,6 +414,7 @@ def prep_sim_data(csv_path="input.csv"):
 
 ##########################
 VAR_ID_FRAME_END = 127  # indicating frame end
+
 FRAME_END_RESEND = 3    # send frame end 3 times when live transmission succeeds
 
 def send_payload(m, data_cols, state, path="outbox.json"):
