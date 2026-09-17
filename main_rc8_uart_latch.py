@@ -64,7 +64,9 @@ except ImportError:
 #                     Quick-window field; codes 9 and 10 gained wording
 #   latch-083026.7    HCLR named float from the GCS acknowledges a stuck fault
 #                     code ("haucs winch clear"). Display only.
-SCRIPT_VERSION = "latch-083026.7"
+#   latch-091726.1    DATA96 pacing (encoder_helper SEND_GAP_S); HRFT replays
+#                     the newest cached cast; HGAP raises new code 13
+SCRIPT_VERSION = "latch-091726.1"
 
 # simulator flags
 data_sim_flag = True
@@ -768,11 +770,13 @@ HAUCS_CODES = {
     3:  "sampling at depth",
     4:  "retract running",
     5:  "cast complete, transmitting",
+    6:  "replaying cached cast",           # 091726
     8:  "LATCH/RELEASE FAILED",
     9:  "RETRACT TIMEOUT",
     10: "SENSOR FAULT",
     11: "NO SAMPLES",
     12: "OVERCURRENT / STALL",
+    13: "DATA GAPS, GCS got an incomplete cast",   # 091726
 }
 
 HAUCS_FIELD = b"HAUCS"          # NAMED_VALUE_FLOAT names are capped at 10 bytes
@@ -1284,6 +1288,65 @@ def cache_sample_csv(cols, cache_dir=CACHE_DIR):
         logger.info("failed to cache sampling data: %s" % e)
         return None
 
+def newest_cache_csv(cache_dir=CACHE_DIR):
+    """091726: path of the most recent cached cast, or None."""
+    try:
+        files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir)
+                 if f.startswith("sample_") and f.endswith(".csv")]
+        if not files:
+            return None
+        return max(files, key=os.path.getmtime)
+    except Exception as e:
+        logger.info("091726 newest_cache_csv: %s" % e)
+        return None
+
+
+def replay_latest_cache(link, state, cfg):
+    """091726: re-transmit the most recent cached cast over DATA96.
+
+    The GCS asks for this with "haucs winch refetch" when it commits a cast
+    with gaps. The Pi always has the complete data in its cache -- the gaps
+    are transmission losses, not sampling losses -- so a replay is the cheap
+    fix and needs no flying.
+
+    Runs on the caller's thread, which is mav_thread. A replay blocks that
+    loop for as long as the send takes (frames * SEND_GAP_S), exactly as a
+    normal post-cast send already does, so RC edges are not serviced during
+    it. Do not call this while the winch is moving.
+    """
+    path = newest_cache_csv()
+    if path is None:
+        logger.info("091726 refetch: no cached cast to replay")
+        haucs_code(13, "refetch: no cached cast found", cfg)
+        return False
+    try:
+        cols = load_csv(path)
+    except Exception as e:
+        logger.info("091726 refetch: could not read %s: %s" % (path, e))
+        haucs_code(13, "refetch: cache unreadable", cfg)
+        return False
+
+    n = len(cols.get("DO") or [])
+    if n == 0:
+        logger.info("091726 refetch: %s has no samples" % path)
+        haucs_code(13, "refetch: cache empty", cfg)
+        return False
+
+    logger.info("091726 refetch: replaying %s (%d samples)"
+                % (os.path.basename(path), n))
+    haucs_code(6, "refetch: replaying %d samples" % n, cfg)
+    t0 = time.time()
+    try:
+        send_payload_reported(link, cols, state, cfg)
+    except Exception as e:
+        logger.info("091726 refetch: send failed: %s" % e)
+        haucs_code(13, "refetch send failed", cfg)
+        return False
+    logger.info("091726 refetch: replay finished in %.1fs" % (time.time() - t0))
+    haucs_code(5, "refetch complete, %d samples" % n, cfg)
+    return True
+
+
 def ble_thread(stop_evt, q_ble, q_mav, st):
     ble = st["ble"] = BluetoothReader(st["ble_mutex"])
 
@@ -1677,11 +1740,36 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 # does not hide it.
                 if msg_type == "NAMED_VALUE_FLOAT":
                     try:
-                        if str(msg.name).rstrip("\x00").strip() == "HCLR":
+                        _nm = str(msg.name).rstrip("\x00").strip()
+                        if _nm == "HCLR":
                             if _hstat["code"] != 0:
                                 logger.info("083026 GCS cleared HAUCS code %d"
                                             % _hstat["code"])
                             haucs_code(0, None, wincfg)
+                        elif _nm == "HGAP":
+                            # 091726: the GCS committed a cast with missing
+                            # frames. Only it can know this - the Pi's own copy
+                            # is complete. Surfacing it as a code means the
+                            # operator sees it on the HUD instead of having to
+                            # read the GCS log.
+                            logger.info("091726 GCS reports %d missing slots"
+                                        % int(msg.value))
+                            haucs_code(13, "GCS: %d slots missing, refetch to fix"
+                                       % int(msg.value), wincfg)
+                        elif _nm == "HRFT":
+                            # 091726: "haucs winch refetch". Replays the newest
+                            # cached cast. Blocks this loop for the duration of
+                            # the send, so it is refused while the winch is
+                            # commanded - losing RC edge detection mid-cast
+                            # would be far worse than a delayed replay.
+                            if _hstat["code"] in (1, 2, 3, 4):
+                                logger.info("091726 refetch refused: winch busy "
+                                            "(code %d)" % _hstat["code"])
+                                gcs_status("refetch refused, winch busy",
+                                           wincfg, force=True)
+                            else:
+                                replay_latest_cache(payload_link, sensor_state,
+                                                    wincfg)
                     except Exception as e:
                         logger.info("083026 HCLR handler: %s" % e)
                     continue
