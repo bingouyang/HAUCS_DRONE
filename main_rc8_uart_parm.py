@@ -839,6 +839,48 @@ def send_payload_reported(link, cols, state, cfg):
     except Exception as e:
         logger.info("081426 frame count failed: %s" % e)
 
+    # 091726: the exact frame manifest, so the Pi's log can be diffed against
+    # the GCS's "RX MAP" line. Temp chunk 0 has now gone missing twice with
+    # pacing active, which rules out link throughput -- so the question is
+    # whether the Pi ever built and queued that frame, or whether it was built
+    # and then lost or discarded. This answers the first half.
+    #
+    # Note the ORDER: prepare_per_var_queues() assigns sequence numbers in
+    # per-variable blocks, but send_or_buffer_all() transmits round-robin, one
+    # frame per variable per pass. Frames therefore arrive out of sequence,
+    # which is worth having on the record if the receiver turns out to assume
+    # otherwise.
+    try:
+        _seq0 = state.get("seq", 0)
+        _plan, _s = [], _seq0
+        for _name in SEND_ORDER:
+            _vals = cols.get(_name) or []
+            if not _vals:
+                continue
+            _w = max_samples(SEND_ORDER.index(_name))
+            _nf = (len(_vals) + _w - 1) // _w
+            for _c in range(_nf):
+                _n = min(_w, len(_vals) - _c * _w)
+                _plan.append((_s, SEND_ORDER.index(_name), _name, _c, _n))
+                _s += 1
+        logger.info("091726 TX PLAN: %d frames seq %d..%d | %s"
+                    % (len(_plan), _seq0, _s - 1,
+                       "  ".join("%s c%d:%d(s%d)" % (nm, c, n, sq)
+                                 for sq, vid, nm, c, n in _plan)))
+        # and the order they will actually go out in
+        _by_var = {}
+        for rec in _plan:
+            _by_var.setdefault(rec[2], []).append(rec)
+        _wire, _i = [], 0
+        while any(_by_var.values()):
+            for _name in SEND_ORDER:
+                if _by_var.get(_name):
+                    _wire.append(_by_var[_name].pop(0)[0])
+        logger.info("091726 TX WIRE ORDER (seq): %s"
+                    % " ".join(str(x) for x in _wire))
+    except Exception as e:
+        logger.info("091726 TX plan failed: %s" % e)
+
     before = sum(len(v) for v in (state.get("failed") or {}).values())
     gcs_status("TX %d frames, %d samples" % (n_frames, n_samples), cfg,
                force=True)
