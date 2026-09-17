@@ -1296,7 +1296,11 @@ def replay_latest_cache(link, state, cfg):
         haucs_code(13, "refetch send failed", cfg)
         return False
     logger.info("091726 refetch: replay finished in %.1fs" % (time.time() - t0))
-    haucs_code(5, "refetch complete, %d samples" % n, cfg)
+    # 091726: back to idle, not 5. Code 5 means "cast complete, transmitting",
+    # which is over by the time this line runs -- and unlike a real cast there
+    # is no cycle_deactivated event afterwards to queue NEUTRAL and clear it,
+    # so a 5 left here would sit on the HUD indefinitely.
+    haucs_code(0, "refetch complete, %d samples" % n, cfg)
     return True
 
 
