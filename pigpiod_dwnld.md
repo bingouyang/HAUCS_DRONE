@@ -10,6 +10,7 @@ sudo make install
 sudo ldconfig
 
 # 1. Copy the systemd service template from the source folder to the system directory
+(edit pigpiod.service, point to /usr/local/bin/pigpiod)
 sudo cp util/pigpiod.service /lib/systemd/system/
 
 # 2. Reload systemd to recognize the newly added service file
