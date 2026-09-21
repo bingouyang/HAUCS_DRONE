@@ -3,6 +3,7 @@ wget https://github.com/joan2937/pigpio/archive/refs/tags/v79.tar.gz
 # 3. Extract the tar file
 tar zxf v79.tar.gz
 
+
 # 4. Navigate into the folder, build, and install
 cd pigpio-79
 make
