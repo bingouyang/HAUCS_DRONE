@@ -36,6 +36,15 @@ except Exception as _e:          # pragma: no cover
     INA226 = None
     _INA_IMPORT_ERR = _e
 
+# 092226: BME280 enclosure monitoring for LEAK DETECTION. Guarded the same way
+# -- a missing bme_helper.py or an absent sensor must not affect the winch.
+try:
+    from bme_helper import BME280
+    _BME_IMPORT_ERR = None
+except Exception as _e:          # pragma: no cover
+    BME280 = None
+    _BME_IMPORT_ERR = _e
+
 # 083026: fault injector. Subclasses LinkedHallADC and blocks motion at chosen
 # moments, so the REAL code paths run: release_win() exhausts its latch pulses,
 # retract runs to its timeout, the ADC except branches fire. Imported guarded
@@ -67,7 +76,11 @@ except ImportError:
 #                     code ("haucs winch clear"). Display only.
 #   direct-091726.1   DATA96 pacing (encoder_helper SEND_GAP_S); HRFT replays
 #                     the newest cached cast; HGAP raises new code 13
-SCRIPT_VERSION = "direct-091726.1"
+#   direct-091826.1   code 7 on a completed retract (a successful retract set
+#                     no code, so the HUD stayed on 4); refetch ends at 0
+#   direct-092226.1   BME280 enclosure monitoring for leak detection:
+#                     EHUM / EDEW / EPRES / ETEMP on the HUD
+SCRIPT_VERSION = "direct-092226.1"
 
 # simulator flags
 data_sim_flag = False
@@ -183,6 +196,21 @@ wParms = {
     # around 3 A, so 1.5 A is clear of normal and below the converter ceiling.
     "INA_STALL_A": 1.5,
     "INA_STALL_SEC": 0.75,      # sustained for this long before it is reported
+    # 092226: BME280 in the enclosure, for leak detection. 0x76 default.
+    # DEFAULT OFF: not every airframe has this sensor fitted. Set to 1 on the
+    # ones that do. Left at 1 by default, a drone without the part would log
+    # an init failure every boot, which reads like a fault rather than an
+    # absent option.
+    "BME_ENABLE": 0,
+    "BME_ADDR": 0x76,
+    "BME_POLL_HZ": 1.0,        # an enclosure's humidity is a trend, not an event
+    "BME_HUD_HZ": 0.5,         # 4 fields at 0.5 Hz is 2 msg/s of telemetry
+    # Dew point above this is reported as a possible leak. Dew point rather
+    # than RH because RH falls as the enclosure warms in the sun even with the
+    # water content unchanged, so an RH threshold hides a leak on a hot day.
+    # 20 C is a starting point: set it from a dry baseline log across a full
+    # temperature cycle, not from a single reading.
+    "BME_DEW_WARN_C": 20.0,
     # 083026: 1 = pilot-critical text is promoted to SEV_ALERT and flashes on
     # the Mission Planner HUD. 0 = everything goes at INFO, so the Messages tab
     # is unchanged but the HUD flash stops. Set 0 once HAUCS is bound to a
@@ -684,6 +712,7 @@ HAUCS_CODES = {
     4:  "retract running",
     5:  "cast complete, transmitting",
     6:  "replaying cached cast",           # 091726
+    7:  "retracted, awaiting data fetch",  # 091826
     8:  "LATCH/RELEASE FAILED",
     9:  "RETRACT TIMEOUT",
     10: "SENSOR FAULT",
@@ -748,7 +777,7 @@ def haucs_tick(m, now=None):
 # against. mav_thread never calls read(); it reads the cached attributes, so
 # the two threads cannot race the helper's rate limiter or failure counter.
 _ina = {"dev": None, "stall_since": 0.0, "stall_reported": False,
-        "hud_last": 0.0}
+        "hud_last": 0.0, "drops": 0, "recoveries": 0}
 
 
 def set_ina(dev):
@@ -761,6 +790,18 @@ def ina_poll(cfg=None):
     dev = _ina["dev"]
     if dev is None:
         return (None, None)
+    # 091826: the helper drops the device after repeated I2C errors and now
+    # brings it back on its own. Log each transition, because the only symptom
+    # otherwise is WVOLT/WAMP/WPKA quietly disappearing from the HUD while the
+    # status code keeps working -- which is hard to interpret from the ground.
+    _d, _r = getattr(dev, "drops", 0), getattr(dev, "recoveries", 0)
+    if _d != _ina.get("drops", 0):
+        _ina["drops"] = _d
+        logger.info("091826 rail monitor DROPPED (%s); retrying every %.0fs"
+                    % (getattr(dev, "err", "?"), getattr(dev, "retry_sec", 0)))
+    if _r != _ina.get("recoveries", 0):
+        _ina["recoveries"] = _r
+        logger.info("091826 rail monitor RECOVERED after %d drop(s)" % _d)
     try:
         v, a = dev.read()
     except Exception as e:              # the helper guards itself; belt and braces
@@ -787,6 +828,83 @@ def ina_poll(cfg=None):
         _ina["stall_since"] = 0.0
         _ina["stall_reported"] = False
     return (v, a)
+
+
+# ---------------------------------------------------------------------------
+# 092226: BME280 enclosure monitoring. Same ownership rule as the INA226 --
+# winch_thread polls, mav_thread only reads the cached attributes, so the two
+# threads cannot race the helper's rate limiter or failure counter.
+_bme = {"dev": None, "hud_last": 0.0, "warned": False,
+        "drops": 0, "recoveries": 0}
+
+
+def set_bme(dev):
+    _bme["dev"] = dev
+
+
+def bme_poll(cfg=None):
+    """Poll the enclosure sensor. Rate-limited inside the helper. Returns
+    (temp_C, pressure_hPa, humidity_pct, dewpoint_C), any of which may be
+    None."""
+    dev = _bme["dev"]
+    if dev is None:
+        return (None, None, None, None)
+
+    _d, _r = getattr(dev, "drops", 0), getattr(dev, "recoveries", 0)
+    if _d != _bme.get("drops", 0):
+        _bme["drops"] = _d
+        logger.info("092226 BME280 DROPPED (%s); retrying every %.0fs"
+                    % (getattr(dev, "err", "?"), getattr(dev, "retry_sec", 0)))
+    if _r != _bme.get("recoveries", 0):
+        _bme["recoveries"] = _r
+        logger.info("092226 BME280 RECOVERED after %d drop(s)" % _d)
+
+    try:
+        t, p, h, dp = dev.read()
+    except Exception as e:
+        logger.info("092226 bme read raised: %s" % e)
+        return (None, None, None, None)
+
+    # Latched, so a wet enclosure reports once rather than every poll. Not
+    # wired to a HAUCS code: a leak is not a winch fault and should not
+    # displace a latch or retract failure on the operator's screen.
+    if cfg is not None and dp is not None:
+        _th = float(cfg.get("BME_DEW_WARN_C", 20.0))
+        if dp >= _th and not _bme["warned"]:
+            _bme["warned"] = True
+            logger.info("WARNING: 092226 enclosure dew point %.1f C >= %.1f C "
+                        "- possible water ingress (RH %.0f%%, %.1f C, %.1f hPa)"
+                        % (dp, _th, h or 0.0, t or 0.0, p or 0.0))
+            gcs_status("LEAK? dew %.0fC RH %.0f%%" % (dp, h or 0.0),
+                       cfg, force=True)
+        elif dp < _th - 1.0 and _bme["warned"]:
+            _bme["warned"] = False      # 1 C hysteresis, no chatter
+            logger.info("092226 enclosure dew point back to %.1f C" % dp)
+    return (t, p, h, dp)
+
+
+def bme_hud_tick(m, cfg, now=None):
+    """Send EHUM / EPRES / ETEMP / EDEW. Reads cached values only -- no I2C
+    from this thread. Mission Planner prefixes received named floats with
+    MAV_, so these appear as MAV_EHUM etc and sort under M."""
+    dev = _bme["dev"]
+    if m is None or dev is None or not cfg.get("BME_ENABLE", 0):
+        return
+    now = now or time.time()
+    period = 1.0 / float(cfg.get("BME_HUD_HZ", 0.5) or 0.5)
+    if (now - _bme["hud_last"]) < period:
+        return
+    _bme["hud_last"] = now
+    if not getattr(dev, "available", False) or dev.temp is None:
+        return
+    # humidity first: it is the one being watched
+    if dev.humidity is not None:
+        _named_float(m, b"EHUM", dev.humidity)
+    if dev.dewpoint is not None:
+        _named_float(m, b"EDEW", dev.dewpoint)
+    if dev.pressure is not None:
+        _named_float(m, b"EPRES", dev.pressure)
+    _named_float(m, b"ETEMP", dev.temp)
 
 
 def ina_hud_tick(m, cfg, now=None):
@@ -1122,6 +1240,38 @@ def winch_thread(stop_evt, q_winch, cfg, st):
     else:
         logger.info("083026 rail monitor disabled (INA_ENABLE=0)")
 
+    # 092226: BME280 enclosure sensor. Shares the INA226's open SMBus when
+    # there is one, so there is a single file descriptor on /dev/i2c-1 for
+    # both. Separate try block, and set_bme() is only reached on success, so
+    # any failure leaves _bme["dev"] as None and every call site is a no-op.
+    if cfg.get("BME_ENABLE", 0):
+        try:
+            if BME280 is None:
+                logger.info("092226 BME280 unavailable: %s" % _BME_IMPORT_ERR)
+            else:
+                _shared = getattr(_ina.get("dev"), "bus", None)
+                bdev = BME280(addr=cfg["BME_ADDR"],
+                              bus=_shared,
+                              rate_hz=cfg["BME_POLL_HZ"])
+                if bdev.available:
+                    set_bme(bdev)
+                    t, p, h, dp = bdev.read(force=True)
+                    logger.info("092226 BME280 ready: chip=0x%02X %s  "
+                                "%.2f C, %.2f hPa, %s"
+                                % (bdev.chip_id,
+                                   "BME280" if bdev.has_humidity else
+                                   "BMP280 (NO HUMIDITY - leak detection will "
+                                   "not work with this part)",
+                                   t or 0.0, p or 0.0,
+                                   ("RH %.1f%%, dew %.1f C" % (h, dp))
+                                   if h is not None else "no humidity channel"))
+                else:
+                    logger.info("092226 BME280 init failed: %s" % bdev.err)
+        except Exception as e:
+            logger.info("092226 BME280 init raised: %s" % e)
+    else:
+        logger.info("092226 BME280 disabled (BME_ENABLE=0)")
+
     logger.info("winch ready")
     try:
         while not stop_evt.is_set():
@@ -1140,6 +1290,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
             # while the winch is sitting still. The helper rate-limits itself,
             # so this costs a comparison on most passes.
             ina_poll(wParms)
+            bme_poll(wParms)                             # 092226
 
             if cmd:
                 act = (cmd.get("action") or "").upper()
@@ -1170,6 +1321,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     if float(cfg.get("STEP_MOVE_SEC", 0.0)) > 0.0:
                         retract_stepped(servo, adc, cfg, st, stop_evt, dur)
                         neutral(servo, cfg)
+                        haucs_code(7, None, cfg)             # 091826
                         q_winch.task_done()
                         continue
 
@@ -1182,10 +1334,12 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     # sensor a moving winch far from home reads flat for
                     # seconds, so "no progress" cannot be told from "stalled",
                     # and any fixed threshold breaks at a different cast depth.
+                    _home = False
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
                             logger.info("Fully retractd!")
+                            _home = True
                             break
 
                         time.sleep(0.1)
@@ -1193,6 +1347,15 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                         haucs_code(9, "retract timeout, not fully retracted",
                                    cfg)                      # 083026
                         logger.info("WARNING: Retract timeout, not fully retracted, future release prevented for now")
+                    elif _home:
+                        # 091826: a SUCCESSFUL retract set no code at all. The
+                        # timeout path raised 9 and the failure paths raised
+                        # their own, but breaking out on "Fully retractd!" fell
+                        # straight through to neutral(), so the HUD stayed on 4
+                        # ("retract running") with the winch stopped and drawing
+                        # nothing. Only a later FETCH moved it on, so a
+                        # winch-only test sat at 4 indefinitely.
+                        haucs_code(7, None, cfg)
                     neutral(servo, cfg)
 
                 elif act == "NEUTRAL":
@@ -1634,6 +1797,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             # too - the numbers keep updating even when no messages arrive.
             _now = time.time()
             ina_hud_tick(m_fc, wincfg, _now)
+            bme_hud_tick(m_fc, wincfg, _now)             # 092226
             haucs_tick(m_fc, _now)
 
             if DEBUG_TRIGGER_TIMING:
