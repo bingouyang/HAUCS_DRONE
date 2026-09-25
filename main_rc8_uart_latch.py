@@ -86,7 +86,11 @@ except ImportError:
 #                     stopped, 1500 = commanded neutral)
 #   latch-092526.1    return to code 0 once the payload send completes; code
 #                     5 was terminal and sat on the HUD after every cast
-SCRIPT_VERSION = "latch-092526.1"
+#   latch-092526.2    stepped ascent: stop the move the moment Hall reaches
+#                     the settle window, and sample the rail during the move.
+#                     It drove blind for the full STEP_MOVE_SEC, so arriving
+#                     early meant grinding against the stop for the remainder.
+SCRIPT_VERSION = "latch-092526.2"
 
 # simulator flags
 data_sim_flag = True
@@ -750,7 +754,44 @@ def retract_stepped(servo, adc, cfg, st, stop_evt, dur):
 
         servo.value = float(drive)
         m_end = time.time() + move_s
+        # 092526: the move phase used to be a bare sleep loop -- no Hall read,
+        # no current sample, no early exit. With STEP_MOVE_SEC at 10 s, a winch
+        # that reached the mechanical stop one second in would grind against it
+        # for the remaining nine, every stage, and nothing could see it: the
+        # settle check only ran after the move, and ina_poll() is reached
+        # through hall_raw(), which this loop never called. So the overcurrent
+        # detector was blind during exactly the window that damages a servo.
+        #
+        # Reading Hall here does NOT reintroduce the polarity guard the
+        # docstring warns about -- that guard lives in retract_adaptive(), not
+        # in a bare hall_raw(). All this asks is "have we arrived", which is a
+        # threshold far from the start transient. Two consecutive confirmations
+        # are required so a single noisy read during motor run cannot end a
+        # stage early.
+        _arrived = 0
+        _next_hall = time.time() + 0.2
         while time.time() < m_end and not stop_evt.is_set():
+            ina_poll(cfg)
+            servo_sample()
+            if time.time() >= _next_hall:
+                _next_hall = time.time() + 0.2
+                try:
+                    if (hall_raw(adc) - cfg["HALL_TARGET"]) < cfg["RETRACT_SETTLE"]:
+                        _arrived += 1
+                    else:
+                        _arrived = 0
+                except Exception:
+                    _arrived = 0        # a failed read is not an arrival
+                if _arrived >= 2:
+                    neutral(servo, cfg)
+                    st["RETRACTED"] = 1
+                    fsm_st["deploy_allowed"] = True
+                    logger.info("092526 stepped: reached settle DURING stage %d "
+                                "after %.1fs of a %.1fs move - stopped early"
+                                % (step, move_s - (m_end - time.time()), move_s))
+                    gcs_status("ascent done %d stages %.0fs" %
+                               (step, time.time() - t0), cfg, force=True)
+                    return True
             time.sleep(0.02)
         neutral(servo, cfg)
 
