@@ -80,7 +80,12 @@ except ImportError:
 #                     no code, so the HUD stayed on 4); refetch ends at 0
 #   direct-092226.1   BME280 enclosure monitoring for leak detection:
 #                     EHUM / EDEW / EPRES / ETEMP on the HUD
-SCRIPT_VERSION = "direct-092226.1"
+#   direct-092426.1   neutral() guarded: a dead pigpio socket raised from
+#                     winch_thread's finally: and killed the thread silently.
+#                     New code 14 when winch_thread exits unexpectedly.
+#   direct-092426.2   commanded servo PWM on the HUD as WPWM (0 = pulses
+#                     stopped, 1500 = commanded neutral)
+SCRIPT_VERSION = "direct-092426.2"
 
 # simulator flags
 data_sim_flag = False
@@ -211,6 +216,9 @@ wParms = {
     # 20 C is a starting point: set it from a dry baseline log across a full
     # temperature cycle, not from a single reading.
     "BME_DEW_WARN_C": 20.0,
+    # 092426: commanded servo PWM to the HUD, in microseconds. 0 = pulses
+    # stopped (servo off, drawing nothing), 1500 = commanded neutral.
+    "SERVO_HUD_HZ": 2.0,
     # 083026: 1 = pilot-critical text is promoted to SEV_ALERT and flashes on
     # the Mission Planner HUD. 0 = everything goes at INFO, so the Messages tab
     # is unchanged but the HUD flash stops. Set 0 once HAUCS is bound to a
@@ -437,6 +445,70 @@ def process_statustext(txt, st):
     if "mission" in s and "complete" in s:
         st["awaiting_final_td"] = True
 
+# ---------------------------------------------------------------------------
+# 092426: commanded servo PWM on the HUD.
+#
+# Read back from the servo object rather than tracked at each assignment --
+# there are several places that write servo.value (release_win, retract_
+# adaptive, retract_stepped, neutral, the winch loop) and a tracker would have
+# to be added to every one of them and kept in step forever. Reading the object
+# cannot drift.
+#
+# Sampled from BOTH the winch_thread loop and hall_raw(), because during a cast
+# winch_thread is inside release_win()/retract_adaptive() and its own loop is
+# not turning -- which is exactly when the PWM is interesting. hall_raw() runs
+# throughout both.
+_servo = {"dev": None, "value": None, "usec": None, "hud_last": 0.0}
+
+# Must match the Servo() construction below.
+SERVO_MIN_PW = 0.0009
+SERVO_MAX_PW = 0.0021
+
+
+def set_servo_ref(servo):
+    _servo["dev"] = servo
+
+
+def servo_usec(v):
+    """Commanded value (-1..+1) to microseconds. None means no pulses."""
+    if v is None:
+        return 0
+    pw = SERVO_MIN_PW + ((float(v) + 1.0) / 2.0) * (SERVO_MAX_PW - SERVO_MIN_PW)
+    return int(round(pw * 1e6))
+
+
+def servo_sample():
+    """Cache the commanded servo position. Never raises: a dead pigpio socket
+    makes servo.value raise, and that must not propagate into the Hall path."""
+    dev = _servo["dev"]
+    if dev is None:
+        return
+    try:
+        v = dev.value
+    except Exception:
+        # pigpio gone; leave the last known value rather than reporting a
+        # position that is not being commanded
+        return
+    _servo["value"] = v
+    _servo["usec"] = servo_usec(v)
+
+
+def servo_hud_tick(m, cfg, now=None):
+    """Send WPWM, the commanded pulse width in microseconds. 0 means the pulse
+    train is stopped and the servo is drawing nothing -- deliberately distinct
+    from 1500, which is a commanded neutral and DOES draw current."""
+    if m is None or _servo["dev"] is None:
+        return
+    now = now or time.time()
+    period = 1.0 / float(cfg.get("SERVO_HUD_HZ", 2.0) or 2.0)
+    if (now - _servo["hud_last"]) < period:
+        return
+    _servo["hud_last"] = now
+    if _servo["usec"] is None:
+        return
+    _named_float(m, b"WPWM", _servo["usec"])
+
+
 def hall_raw(c):
     # 083026: the rail is polled here so voltage and current are sampled within
     # milliseconds of the Hall value. That adjacency is the point: Hall frozen
@@ -445,6 +517,7 @@ def hall_raw(c):
     # The helper rate-limits internally, so calling it from this hot path costs
     # a comparison on most passes.
     ina_poll(wParms)
+    servo_sample()                                   # 092426
     if adc_sim_flag == 1:
         return int(c.read())
     else:
@@ -719,6 +792,7 @@ HAUCS_CODES = {
     11: "NO SAMPLES",
     12: "OVERCURRENT / STALL",
     13: "DATA GAPS, GCS got an incomplete cast",   # 091726
+    14: "WINCH CONTROL LOST (pigpio/servo)",        # 092426
 }
 
 HAUCS_FIELD = b"HAUCS"          # NAMED_VALUE_FLOAT names are capped at 10 bytes
@@ -1129,12 +1203,33 @@ def neutral(servo, cfg):
     #
     # The simulator keeps the old behaviour: ServoSim/LinkedHallADC read
     # servo.value to model the winch, and None is not a value they expect.
-    if adc_sim_flag == 1:
-        servo.value = cfg["NEUTRAL_POS"]
-        logger.info('inside neutral (sim, holding neutral value)')
-    else:
-        servo.value = None
-        logger.info('inside neutral (pulses stopped)')
+    #
+    # 092426: guarded. This is the last-ditch safety call and it is invoked
+    # from winch_thread's finally: block -- where an exception escapes PAST the
+    # enclosing "except Exception" and kills the thread outright. That happened
+    # in the field: pigpiod's socket died mid-command
+    #     struct.error: unpack requires a buffer of 16 bytes
+    #     BrokenPipeError: [Errno 32] Broken pipe
+    # and winch_thread was gone for the rest of the session while mav_thread
+    # and ble_thread carried on, so the script looked healthy and the winch
+    # silently was not. Never let the stop-the-servo call be the thing that
+    # stops the winch.
+    try:
+        if adc_sim_flag == 1:
+            servo.value = cfg["NEUTRAL_POS"]
+            logger.info('inside neutral (sim, holding neutral value)')
+        else:
+            servo.value = None
+            logger.info('inside neutral (pulses stopped)')
+        return True
+    except Exception as e:
+        # A broken pigpio connection means the servo cannot be commanded at
+        # all. Report it loudly -- the pulse train stops on its own when the
+        # daemon dies, so the servo is not left driving, but the winch is
+        # uncontrollable until pigpiod is back.
+        logger.info("WARNING: 092426 neutral() failed, servo not commandable: "
+                    "%s: %s" % (e.__class__.__name__, e))
+        return False
 
 def broadcast_value(x, n):
     return [] if n <= 0 else [x] * n
@@ -1156,6 +1251,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
     except Exception as e:
         logger.info("Servo init failed: %s" % e)
         return
+    set_servo_ref(servo)                             # 092426
 
     try:
         if adc_sim_flag == 1:
@@ -1291,6 +1387,7 @@ def winch_thread(stop_evt, q_winch, cfg, st):
             # so this costs a comparison on most passes.
             ina_poll(wParms)
             bme_poll(wParms)                             # 092226
+            servo_sample()                               # 092426
 
             if cmd:
                 act = (cmd.get("action") or "").upper()
@@ -1369,7 +1466,20 @@ def winch_thread(stop_evt, q_winch, cfg, st):
         neutral(servo, cfg)
 
     finally:
+        # 092426: everything here is guarded. winch_thread exiting is itself
+        # the emergency -- the other threads keep running, so nothing else
+        # notices. Say so on the HUD rather than leaving the last progress
+        # code sitting there looking normal.
         neutral(servo, cfg)
+        try:
+            if not stop_evt.is_set():
+                logger.info("WARNING: 092426 winch_thread EXITED while the "
+                            "script is still running - the winch is dead for "
+                            "the rest of this session")
+                haucs_code(14, "winch thread exited, winch unavailable",
+                           cfg, sev=SEV_ALERT)
+        except Exception as e:
+            logger.info("092426 winch_thread exit notice failed: %s" % e)
         # 083026: stall seconds and modelled wear for the session. Only the
         # fault injector reports these; the plain simulator has no summary().
         try:
@@ -1798,6 +1908,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             _now = time.time()
             ina_hud_tick(m_fc, wincfg, _now)
             bme_hud_tick(m_fc, wincfg, _now)             # 092226
+            servo_hud_tick(m_fc, wincfg, _now)           # 092426
             haucs_tick(m_fc, _now)
 
             if DEBUG_TRIGGER_TIMING:
