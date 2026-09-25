@@ -90,7 +90,10 @@ except ImportError:
 #                     the settle window, and sample the rail during the move.
 #                     It drove blind for the full STEP_MOVE_SEC, so arriving
 #                     early meant grinding against the stop for the remainder.
-SCRIPT_VERSION = "latch-092526.2"
+#   latch-092526.3    servo constructed with initial_value=None. It was
+#                     built HOLDING 1500 us and stayed there until the first
+#                     neutral() -- the ~12 W state, for the whole pre-flight.
+SCRIPT_VERSION = "latch-092526.3"
 
 # simulator flags
 data_sim_flag = True
@@ -1378,7 +1381,16 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                 max_pulse_width=0.0021,
                 frame_width=0.02,
                 pin_factory=PiGPIOFactory(),
-                initial_value=cfg["NEUTRAL_POS"],
+                # 092526: was cfg["NEUTRAL_POS"] (0.0), which constructs the
+                # servo ACTIVELY HOLDING 1500 us and leaves it there until the
+                # first neutral() call -- i.e. for the whole pre-flight period
+                # before the first cast, and after any restart. A continuous
+                # rotation servo told to hold still still draws current and
+                # heats: a damaged Triple4 was measured dissipating ~12 W in
+                # exactly this state. test_servor.py was corrected for this on
+                # 082526; the flight script was not. None starts with the pulse
+                # train stopped, so the servo is only driven when asked.
+                initial_value=None,
             )
     except Exception as e:
         logger.info("Servo init failed: %s" % e)
