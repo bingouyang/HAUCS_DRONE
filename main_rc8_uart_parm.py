@@ -87,7 +87,10 @@ except ImportError:
 #                     stopped, 1500 = commanded neutral)
 #   direct-092526.1   return to code 0 once the payload send completes; code
 #                     5 was terminal and sat on the HUD after every cast
-SCRIPT_VERSION = "direct-092526.1"
+#   direct-092526.2   sample the rail and servo during the descent loop;
+#                     the timer-based release never read Hall, so WAMP /
+#                     WPKA / WPWM froze for the whole of RELEASE_SEC
+SCRIPT_VERSION = "direct-092526.2"
 
 # simulator flags
 data_sim_flag = False
@@ -602,6 +605,16 @@ def release_win(servo, adc, cfg, st, stop_evt):
 
         # 082326: mid-release polarity check removed; the servo no longer
         # flips direction on its own.
+        #
+        # 092526: sample the rail and the servo here. The direct-drive descent
+        # is a pure timer -- it never reads the Hall sensor, so nothing called
+        # ina_poll()/servo_sample() for the whole of RELEASE_SEC and WAMP,
+        # WPKA and WPWM all froze at their pre-release values. retract_adaptive
+        # reads Hall every pass, which is why the retract phase looked fine.
+        # Descent is exactly when the current matters: it is the servo driving
+        # out under load, and WPKA is reset immediately above for this cast.
+        ina_poll(cfg)
+        servo_sample()
         time.sleep(0.1)
 
     st["RETRACTED"] = 0  # mark as extended after descent completes
