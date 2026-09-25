@@ -84,7 +84,9 @@ except ImportError:
 #                     New code 14 when winch_thread exits unexpectedly.
 #   latch-092426.2    commanded servo PWM on the HUD as WPWM (0 = pulses
 #                     stopped, 1500 = commanded neutral)
-SCRIPT_VERSION = "latch-092426.2"
+#   latch-092526.1    return to code 0 once the payload send completes; code
+#                     5 was terminal and sat on the HUD after every cast
+SCRIPT_VERSION = "latch-092526.1"
 
 # simulator flags
 data_sim_flag = True
@@ -2185,6 +2187,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                     if data_sim_flag is True:
                         cols = prep_sim_data(csv_path)
                         send_payload_reported(payload_link, cols, sensor_state, wincfg)
+                        haucs_code(0, None, wincfg)              # 092526
                     else:
                         logger.info("MAV to BLE: fetch data from BLE sensor")
                         q_ble.put({"action": "FETCH"})
@@ -2252,6 +2255,16 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                 try:
                     logger.info("Uploading fetched BLE data: cols:%s" % cols)
                     send_payload_reported(payload_link, cols, sensor_state, wincfg)
+                    # 092526: back to idle. Code 5 means "cast complete,
+                    # TRANSMITTING", and transmission is over on this line --
+                    # but nothing ran after it, so 5 sat on the HUD until the
+                    # next release. Worse, the ordering made it look wrong:
+                    # cycle_deactivated queues NEUTRAL on the servo falling
+                    # edge and sets 0, and only THEN does the fetch finish and
+                    # set 5, so the operator saw 7 -> 0 -> 5 and stopped there.
+                    # Same defect as the retract that stuck on 4 and the
+                    # refetch that stuck on 5; this is the last of that family.
+                    haucs_code(0, None, wincfg)
                 except Exception as e:
                     logger.info("SENDPAYLOAD failed, MAV thread will continue: %s" % e)
                     logger.info(traceback.format_exc())
