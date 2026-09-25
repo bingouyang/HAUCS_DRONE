@@ -93,7 +93,10 @@ except ImportError:
 #   latch-092526.3    servo constructed with initial_value=None. It was
 #                     built HOLDING 1500 us and stayed there until the first
 #                     neutral() -- the ~12 W state, for the whole pre-flight.
-SCRIPT_VERSION = "latch-092526.3"
+#   latch-092526.4    sample inside neutral() and through the bottom pause.
+#                     WPWM kept reporting the last DRIVE value during every
+#                     quiet period - 1680 while idle at depth.
+SCRIPT_VERSION = "latch-092526.4"
 
 # simulator flags
 data_sim_flag = True
@@ -1356,6 +1359,13 @@ def neutral(servo, cfg):
         else:
             servo.value = None
             logger.info('inside neutral (pulses stopped)')
+        # 092526: refresh the cached PWM here. Without it WPWM keeps reporting
+        # the last DRIVE value through every quiet period, because the samplers
+        # hang off hall_raw() and the winch loop -- neither of which runs while
+        # winch_thread is waiting out the bottom pause. The servo really was at
+        # 0, but the HUD showed 1680 from the descent. Doing it inside neutral()
+        # covers every caller at once.
+        servo_sample()
         return True
     except Exception as e:
         # A broken pigpio connection means the servo cannot be commanded at
@@ -1547,7 +1557,22 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     logger.info("Release finished. Idle at bottom for %.1f sec" % pause_sec)
                     haucs_code(3, None, cfg)                 # 083026 at depth
 
-                    if stop_evt.wait(pause_sec):
+                    # 092526: was stop_evt.wait(pause_sec), a single blocking
+                    # wait during which nothing sampled -- so WAMP, WPKA and
+                    # WPWM all froze for the whole bottom pause. Poll in slices
+                    # instead. The servo is idle here, so any current at all is
+                    # worth seeing: it would mean the servo is still being
+                    # driven when nothing asked it to be.
+                    _p_end = time.time() + pause_sec
+                    _aborted = False
+                    while time.time() < _p_end:
+                        if stop_evt.wait(min(0.25, max(0.0, _p_end - time.time()))):
+                            _aborted = True
+                            break
+                        ina_poll(cfg)
+                        bme_poll(cfg)
+                        servo_sample()
+                    if _aborted:
                         continue
 
                     logger.info("Bottom pause finished. Queue RETRACT with timeout %.1f sec" % retract_sec)
