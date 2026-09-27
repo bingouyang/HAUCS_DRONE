@@ -100,7 +100,29 @@ except ImportError:
 #   direct-092526.5   sample inside neutral() and through the bottom pause.
 #                     WPWM kept reporting the last DRIVE value during every
 #                     quiet period - 1680 while idle at depth.
-SCRIPT_VERSION = "direct-092526.5"
+#   direct-092726.1   BLE fetch made recoverable. Four changes, all in the
+#                     FETCH handler, all from the 092726 flight log:
+#                     - a PARTIAL transfer is no longer discarded. `ok` is only
+#                       True when the stream ends with `dfinish`, and the gate
+#                       was `if ok and len(do_list) > 0`, so a cast that
+#                       delivered 187 of 282 samples was logged as "returned no
+#                       samples", raised code 11 (NO SAMPLES), cached nothing
+#                       and uploaded nothing.
+#                     - set_sample_reset() no longer runs unconditionally. It
+#                       was in the `finally`, so it wiped the sensor 100 ms
+#                       after the discard above, destroying the 95 samples that
+#                       had not arrived yet as well as the 187 that had.
+#                     - the transfer is retried. `sample print` dumps the whole
+#                       buffer from the start, so a cut-off transfer is fully
+#                       recoverable by asking again - but only while the reset
+#                       has not run, which is why the two go together.
+#                     - a FETCH that arrives with the link down is held and
+#                       retried for BLE_LINK_WAIT_SEC instead of being dropped
+#                       into a c_status string nothing reads.
+#                     Plus: BLE link state on the HUD as BLES/BLEN, and code 17
+#                     when a release is commanded while a fetch is still
+#                     running (which is what cut the 14:52:57 cast short).
+SCRIPT_VERSION = "direct-092726.1"
 
 # simulator flags
 data_sim_flag = False
@@ -234,6 +256,9 @@ wParms = {
     # 092426: commanded servo PWM to the HUD, in microseconds. 0 = pulses
     # stopped (servo off, drawing nothing), 1500 = commanded neutral.
     "SERVO_HUD_HZ": 2.0,
+    # 092726: BLE link state (BLES) and last-fetch sample count (BLEN) to the
+    # HUD. 1 Hz is plenty -- the state changes a handful of times per cast.
+    "BLE_HUD_HZ": 1.0,
     # 083026: 1 = pilot-critical text is promoted to SEV_ALERT and flashes on
     # the Mission Planner HUD. 0 = everything goes at INFO, so the Messages tab
     # is unchanged but the HUD flash stops. Set 0 once HAUCS is bound to a
@@ -252,12 +277,44 @@ BLE_SAMPLE_RATE = 2
 BLE_PMODE = "high"
 BLE_FETCH_TIMEOUT = 5  # seconds of BLE inactivity during sample download
 
+# 092726: fetch robustness. See the FETCH handler in ble_thread().
+#
+# BLE_FETCH_TRIES      how many times to ask for the buffer before giving up.
+#                      "sample print" dumps the whole buffer from the start
+#                      every time, so a transfer cut off part way through is
+#                      fully recoverable by simply asking again -- provided
+#                      set_sample_reset() has not run yet.
+# BLE_FETCH_MIN_FRAC   fraction of the sensor's reported sample count that has
+#                      to arrive for the cast to count as complete. Slightly
+#                      under 1.0 because a single corrupted record ("data
+#                      corrupted in ble transfer") legitimately drops one
+#                      sample, and re-pulling 280 samples to recover 1 is not
+#                      worth the airtime.
+# BLE_LINK_WAIT_SEC    how long to hold a FETCH request while the link is down
+#                      before writing the cast off. The samples are on the
+#                      sensor, not in flight, so waiting costs nothing but time.
+# BLE_KEEP_ON_PARTIAL  1 = do NOT reset the sensor when samples were lost, so
+#                      the cast can still be pulled on the ground. The cost is
+#                      that auto_sensing() only re-fires at sample_count == 0,
+#                      so the NEXT drop will not self-trigger. Off by default:
+#                      losing one cast beats silently losing the rest of the
+#                      flight.
+BLE_FETCH_TRIES = 3
+BLE_FETCH_MIN_FRAC = 0.98
+BLE_LINK_WAIT_SEC = 60.0
+BLE_KEEP_ON_PARTIAL = 0
+
 ble_st = {
     "ble": None,
     "ble_mutex": QMutex(),
     "last_cols": None,
     "gcs_ready": False,
     "c_status": "init",
+    "fetching": False,      # 092726 True while a sample download is in flight
+    "last_n": 0,            # 092726 samples received by the last fetch
+    "last_expect": 0,       # 092726 samples the sensor said it had
+    "release_t": 0.0,       # 092726 time.time() of the last release commanded
+    "fetch_state": 0,       # 092726 BLE_FETCH_* outcome of the last fetch
 }
 
 # Buffer json
@@ -855,9 +912,56 @@ HAUCS_CODES = {
     12: "OVERCURRENT / STALL",
     13: "DATA GAPS, GCS got an incomplete cast",   # 091726
     14: "WINCH CONTROL LOST (pigpio/servo)",        # 092426
+    15: "BLE LINK DOWN, cast not fetched",          # 092726
+    16: "PARTIAL CAST, samples lost on BLE",        # 092726
+    17: "RELEASE DURING FETCH, cast corrupted",     # 092726
 }
 
 HAUCS_FIELD = b"HAUCS"          # NAMED_VALUE_FLOAT names are capped at 10 bytes
+
+# 092726: BLE link state on the HUD as MAV_BLES. The strings are the
+# st["c_status"] values that ble_thread already writes, so nothing else had to
+# change to expose them -- ble_hud_tick() just looks the current one up.
+#
+# Under 4 is link state, 4-7 is a fetch in or just out of progress, 8+ is a
+# fetch that did not deliver a complete cast. -1 means c_status held a string
+# this table does not know, which is a bug in this file, not a field fault.
+BLE_STATE = {
+    "init": 0,
+    "connected": 1,
+    "disconnected": 2,
+    "reconnecting": 3,
+    "fetching": 4,
+    "fetched": 5,
+    "fetch_partial": 6,
+    "fetch_empty": 7,
+    "fetch_failed": 8,
+    "fetch_skipped_disconnected": 9,
+    "disconnected_by_request": 10,
+}
+
+# 092726: the fetch OUTCOME has to be its own field, not a BLE_STATE value.
+# c_status is rewritten by the 1 Hz reconnect poll in ble_thread, so a fetch
+# result written there survives at most one second before being clobbered back
+# to "connected" -- which is correct for a link state and useless as a record of
+# what the last download delivered. BLEF is sticky: only the fetch handler
+# touches it, so it still reads 2 (PARTIAL) on the ground an hour later.
+BLE_FETCH_NONE = 0
+BLE_FETCH_OK = 1
+BLE_FETCH_PARTIAL = 2
+BLE_FETCH_EMPTY = 3
+BLE_FETCH_ERROR = 4
+BLE_FETCH_NOLINK = 5
+
+BLE_FETCH_STATE = {
+    BLE_FETCH_NONE: "no fetch yet this session",
+    BLE_FETCH_OK: "complete cast",
+    BLE_FETCH_PARTIAL: "PARTIAL, samples lost",
+    BLE_FETCH_EMPTY: "sensor had no samples",
+    BLE_FETCH_ERROR: "fetch raised",
+    BLE_FETCH_NOLINK: "link down, not fetched",
+}
+_blehud = {"last": 0.0}
 
 # code   last value sent, resent at HAUCS_REPEAT_S so a dropped packet cannot
 #        leave a stale number on the operator's screen
@@ -903,6 +1007,73 @@ def haucs_tick(m, now=None):
         return
     _hstat["last_send"] = now
     _named_float(m, HAUCS_FIELD, _hstat["code"])
+
+
+def ble_hud_tick(m, cfg, blest, now=None):
+    """092726: three BLE fields on the HUD.
+
+        BLES  live link state, BLE_STATE above. Changes constantly.
+        BLEF  outcome of the last fetch, BLE_FETCH_STATE above. Sticky.
+        BLEN  samples the last fetch actually RECEIVED -- not the sensor's
+              dsize. BLEN < dsize is exactly what code 16 reports.
+
+    Until now st["c_status"] was written in ten places and read in none, so
+    "fetch_skipped_disconnected" existed only in the source: the operator's only
+    clue that a cast had not been fetched was the HUD sitting on 7."""
+    if m is None or blest is None:
+        return
+    now = now or time.time()
+    period = 1.0 / float(cfg.get("BLE_HUD_HZ", 1.0) or 1.0)
+    if (now - _blehud["last"]) < period:
+        return
+    _blehud["last"] = now
+    _named_float(m, b"BLES", BLE_STATE.get(blest.get("c_status"), -1))
+    _named_float(m, b"BLEF", blest.get("fetch_state") or 0)
+    _named_float(m, b"BLEN", blest.get("last_n") or 0)
+
+
+# ---------------------------------------------------------------------------
+# 092726: BLE sample-list handling.
+#
+# bt_helper accumulates each record into sdata as it arrives, so after a
+# transfer that was cut off the lists hold real, usable samples -- they are
+# just short. Two things have to be handled before they can be used:
+#
+#   1. a retry must not append onto the previous attempt's partial result
+#   2. a transfer cut off mid-record leaves the three lists at DIFFERENT
+#      lengths, and cache_sample_csv() builds its rows with zip(), which
+#      silently truncates to the shortest column -- to zero rows if one of
+#      them happens to be empty. That would look exactly like "no samples".
+_BLE_SAMPLE_KEYS = ("do_vals", "temp_vals", "pressure_vals")
+
+
+def _ble_clear_samples(ble):
+    """Empty the per-sample lists before a (re)transfer. Harmless if bt_helper
+    already clears them itself; essential if it appends."""
+    try:
+        for k in _BLE_SAMPLE_KEYS:
+            if isinstance(ble.sdata.get(k), list):
+                ble.sdata[k] = []
+    except Exception as e:
+        logger.info("092726 _ble_clear_samples: %s: %s"
+                    % (e.__class__.__name__, e))
+
+
+def _ble_samples(ble):
+    """The sample lists as they stand, truncated to a common length."""
+    try:
+        d = ble.sdata
+        do = list(d.get("do_vals") or [])
+        tp = list(d.get("temp_vals") or [])
+        pr = list(d.get("pressure_vals") or [])
+    except Exception as e:
+        logger.info("092726 _ble_samples: %s: %s" % (e.__class__.__name__, e))
+        return {"do": [], "temp": [], "press": []}
+    n = min(len(do), len(tp), len(pr))
+    if n != max(len(do), len(tp), len(pr)):
+        logger.info("092726 ragged sample lists do=%d temp=%d press=%d, "
+                    "truncating to %d" % (len(do), len(tp), len(pr), n))
+    return {"do": do[:n], "temp": tp[:n], "press": pr[:n]}
 
 
 # ---------------------------------------------------------------------------
@@ -1709,6 +1880,11 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                 except Exception:
                     ok = False
 
+                # 092726: this poll owns the LINK state only. It used to write
+                # "connected" over whatever the fetch handler had just put in
+                # c_status, so a fetch outcome survived at most one second --
+                # which is why the outcome now lives in st["fetch_state"], and
+                # why "fetching" is left alone here.
                 if not ok:
                     st["c_status"] = "disconnected"
                     try:
@@ -1716,7 +1892,7 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             st["c_status"] = "connected"
                     except Exception:
                         pass
-                else:
+                elif not st.get("fetching"):
                     st["c_status"] = "connected"
 
             try:
@@ -1733,95 +1909,223 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                 # unreliable part. mav_thread just triggers the winch and records the deploy
                 # location locally (see deploy_lat / deploy_lon below).
                 if action == "FETCH":
-                    logger.info("BLE action:FETCH: %s" % ble.sdata.get("connection"))
-                    if ble.sdata.get("connection"):
+                    _fnow = time.time()
+                    _first_t = float(cmd.get("first_t") or _fnow)
+                    _conn = bool(ble.sdata.get("connection"))
+                    logger.info("BLE action:FETCH: %s" % _conn)
+
+                    # 092726: this used to be `if connection: ... else: set a
+                    # c_status string nothing reads`. A link that was down at
+                    # this instant silently binned the whole cast: no stop
+                    # sampling, no download, no CSV, no upload, no code, and
+                    # the sensor left sampling with a full buffer so the NEXT
+                    # drop could not auto-arm either.
+                    #
+                    # The samples are sitting on the sensor, not in flight, so
+                    # there is nothing time-critical here -- hold the request
+                    # and let the 1 Hz reconnect poll above do its job. Being
+                    # re-queued rather than slept on keeps that poll running.
+                    if not _conn:
+                        _waited = _fnow - _first_t
+                        if _waited < BLE_LINK_WAIT_SEC:
+                            if st.get("c_status") != "reconnecting":
+                                logger.info(
+                                    "092726 FETCH held: BLE link down, waiting up "
+                                    "to %.0f s for reconnect (samples are still "
+                                    "on the sensor)" % BLE_LINK_WAIT_SEC)
+                            st["c_status"] = "reconnecting"
+                            cmd["first_t"] = _first_t
+                            q_ble.put(cmd)
+                            continue
+                        st["c_status"] = "fetch_skipped_disconnected"
+                        st["fetch_state"] = BLE_FETCH_NOLINK        # 092726
+                        logger.info("092726 FETCH abandoned: BLE link still down "
+                                    "after %.1f s" % _waited)
+                        haucs_code(15, "BLE LINK DOWN %.0f s, cast NOT fetched"
+                                   % _waited, wParms, sev=SEV_ALERT)
+                        continue
+
+                    if st.get("c_status") == "reconnecting":
+                        logger.info("092726 FETCH: link recovered after %.1f s, "
+                                    "fetching now" % (_fnow - _first_t))
+
+                    try:
+                        st["c_status"] = "fetching"
+                        st["fetching"] = True         # 092726 interlock
+                        ble.set_sampl_flag(0)
+                        time.sleep(0.1)
+                        sflag = ble.get_sampl_flag()
+                        logger.info("stop sampling sampling flag: %s" % sflag)
+                        s_size = ble.get_sample_size()
+                        # 081426: the message the operator is waiting for.
                         try:
+                            _n = int(s_size[1])
+                        except Exception:
+                            _n = -1
+                        st["last_expect"] = _n
 
-                            ble.set_sampl_flag(0)
-                            time.sleep(0.1)
-                            sflag = ble.get_sampl_flag()
-                            logger.info("stop sampling sampling flag: %s" % sflag)
-                            s_size = ble.get_sample_size()
+                        # 092726: retry the transfer instead of accepting the
+                        # first attempt. "sample print" restarts from the
+                        # beginning of the buffer every time, so a cut-off
+                        # transfer is recoverable in full by asking again --
+                        # which is only true while set_sample_reset() has not
+                        # run. On 092726 a cast lost 95 of 282 samples to a
+                        # link that died mid-transfer, and the old code threw
+                        # away the 187 that HAD arrived and then wiped the
+                        # sensor 100 ms later.
+                        ok = False
+                        best = {"n": 0, "do": [], "temp": [], "press": []}
+                        _need = (int(_n * BLE_FETCH_MIN_FRAC)
+                                 if _n > 0 else 0)
+                        _fetch_t0 = time.time()
+                        for _try in range(1, BLE_FETCH_TRIES + 1):
+                            _ble_clear_samples(ble)
                             ok = bool(ble.get_sample_data(BLE_FETCH_TIMEOUT))
-                            st["sampling"] = False
+                            _got = _ble_samples(ble)
+                            _ngot = len(_got["do"])
+                            if _ngot > best["n"]:
+                                best = dict(_got, n=_ngot)
                             logger.info(
-                                "finish sampling - queue mav cmd to upload data, ok: %s, sample_size:%s"
-                                % (ok, s_size)
-                            )
-                            # 081426: the message the operator is waiting for.
-                            try:
-                                _n = int(s_size[1])
-                            except Exception:
-                                _n = -1
-                            # 083026: was wincfg, which is mav_thread's name for
-                            # the wParms dict and does not exist in ble_thread.
-                            # The NameError was raised while evaluating the
-                            # argument, before gcs_status ran, and unwound the
-                            # whole fetch handler below - no CSV cached, no
-                            # upload queued, on every cast that reached here.
-                            haucs_code(5, "CAST COMPLETE, %d samples" % _n,
-                                       wParms)               # 083026
-                            do_list = ble.sdata.get("do_vals") or []
-                            if ok and len(do_list) > 0:
-                                temp_list = ble.sdata.get("temp_vals") or []
-                                press_list = ble.sdata.get("pressure_vals") or []
-                                n = len(do_list)
-                                logger.info("sampling finished, length:%s" % n)
-                                ts_list = list(range(n))
+                                "092726 fetch try %d/%d: ok=%s got=%d "
+                                "expected=%s need=%d"
+                                % (_try, BLE_FETCH_TRIES, ok, _ngot, _n,
+                                   _need))
+                            if ok and _ngot >= _need:
+                                break
+                            # A release that started after this fetch did means
+                            # the sensor is on its way back down. Retrying just
+                            # burns BLE_FETCH_TIMEOUT per try against a radio
+                            # that is under water, so keep the best attempt.
+                            if float(st.get("release_t") or 0.0) > _fetch_t0:
+                                logger.info(
+                                    "092726 abandoning retries: a release began "
+                                    "during this fetch, the sensor is going back "
+                                    "under water. Keeping %d samples."
+                                    % best["n"])
+                                break
+                            if _try < BLE_FETCH_TRIES and not stop_evt.is_set():
+                                logger.info(
+                                    "092726 incomplete transfer, re-requesting "
+                                    "the buffer (sensor not reset yet)")
+                                time.sleep(0.5)
 
-                                # lat/lon were locked in mav_thread at the moment the winch
-                                # released (deploy rising edge), not re-read here, so this is
-                                # where the sensor actually went, not where the drone drifted
-                                # to by the time fetch happens.
-                                # Keys here must match encoder_helper.VAR_MAP/SEND_ORDER
-                                # exactly ("DO"/"pressure", not "do"/"press") --
-                                # prepare_per_var_queues() does `if name not in data_cols:
-                                # continue`, so a mismatched key is dropped with no error
-                                # or warning at all. This was silently dropping DO and
-                                # pressure from every upload.
-                                # lat/lon are NOT in VAR_MAP, so they're included here for
-                                # the local CSV cache only -- they still won't reach the
-                                # base station until encoder_helper.py is extended to
-                                # carry them (see chat for why that needs more than just
-                                # adding the key -- the residue encoding as-is isn't
-                                # precise enough for GPS coordinates).
-                                st["last_cols"] = {
-                                    "time": ts_list,
-                                    "DO": do_list,
-                                    "temp": temp_list,
-                                    "pressure": press_list,
-                                    "init_DO": broadcast_value(ble.sdata.get("init_do"), n),
-                                    "init_pressure": broadcast_value(ble.sdata.get("init_pressure"), n),
-                                    "batt_v": broadcast_value(ble.sdata.get("battv"), n),
-                                    "lat": broadcast_value(st.get("deploy_lat"), n),
-                                    "lon": broadcast_value(st.get("deploy_lon"), n),
-                                }
-                                cache_sample_csv(st["last_cols"])
-                                st["gcs_ready"] = True
-                                st["c_status"] = "fetched"
-                                q_mav.put({"action": "sendpayload"})
+                        st["sampling"] = False
+                        n = best["n"]
+                        _partial = (not ok) or (_n > 0 and n < _need)
+                        st["last_n"] = n
+                        logger.info(
+                            "finish sampling - queue mav cmd to upload data, "
+                            "ok: %s, received: %d, sample_size:%s"
+                            % (ok, n, s_size)
+                        )
+                        # 092726: code 5 used to be raised HERE, before the
+                        # branch below, and then immediately overwritten by
+                        # 11 on the failure path - which is why the log shows
+                        # "code 5 (cast complete, transmitting)" one
+                        # millisecond before "code 11 (NO SAMPLES)". It also
+                        # reported the sensor's dsize as the sample count
+                        # rather than what actually arrived. Both now happen
+                        # once, after the outcome is known.
+                        if n > 0:
+                            do_list = best["do"]
+                            temp_list = best["temp"]
+                            press_list = best["press"]
+                            logger.info("sampling finished, length:%s" % n)
+                            ts_list = list(range(n))
+
+                            # lat/lon were locked in mav_thread at the moment the winch
+                            # released (deploy rising edge), not re-read here, so this is
+                            # where the sensor actually went, not where the drone drifted
+                            # to by the time fetch happens.
+                            # Keys here must match encoder_helper.VAR_MAP/SEND_ORDER
+                            # exactly ("DO"/"pressure", not "do"/"press") --
+                            # prepare_per_var_queues() does `if name not in data_cols:
+                            # continue`, so a mismatched key is dropped with no error
+                            # or warning at all. This was silently dropping DO and
+                            # pressure from every upload.
+                            # lat/lon are NOT in VAR_MAP, so they're included here for
+                            # the local CSV cache only -- they still won't reach the
+                            # base station until encoder_helper.py is extended to
+                            # carry them (see chat for why that needs more than just
+                            # adding the key -- the residue encoding as-is isn't
+                            # precise enough for GPS coordinates).
+                            st["last_cols"] = {
+                                "time": ts_list,
+                                "DO": do_list,
+                                "temp": temp_list,
+                                "pressure": press_list,
+                                "init_DO": broadcast_value(ble.sdata.get("init_do"), n),
+                                "init_pressure": broadcast_value(ble.sdata.get("init_pressure"), n),
+                                "batt_v": broadcast_value(ble.sdata.get("battv"), n),
+                                "lat": broadcast_value(st.get("deploy_lat"), n),
+                                "lon": broadcast_value(st.get("deploy_lon"), n),
+                            }
+                            cache_sample_csv(st["last_cols"])
+                            st["gcs_ready"] = True
+                            # 092726: a partial cast is still a cast. It is
+                            # cached and uploaded like any other, and the
+                            # operator is told how much of it survived, so
+                            # they can decide whether to re-fly the pond.
+                            # Discarding it was strictly worse: the data was
+                            # gone from the Pi AND from the sensor.
+                            if _partial:
+                                st["c_status"] = "fetch_partial"
+                                st["fetch_state"] = BLE_FETCH_PARTIAL
+                                haucs_code(16, "PARTIAL CAST, %d of %s samples"
+                                           % (n, _n), wParms, sev=SEV_ALERT)
                             else:
-                                st["c_status"] = "fetch_empty"
-                                logger.info("BLE fetch returned no samples; upload skipped")
-                                haucs_code(11, "CAST COMPLETE but 0 samples",
-                                           wParms, sev=SEV_ALERT)   # 083026
-                        except Exception as e:
-                            st["c_status"] = "fetch_failed"
-                            logger.info("fetch failed: %s" % e)
-                        finally:
-                            # Re-arm the buffer for the next arm. auto_sensing()
-                            # on the sensor only re-fires when sample_count == 0, so this reset
-                            # is what lets the next drop trigger itself again. No sample_type
-                            # call needed -- it's never switched away from "auto".
+                                st["c_status"] = "fetched"
+                                st["fetch_state"] = BLE_FETCH_OK
+                                haucs_code(5, "CAST COMPLETE, %d samples" % n,
+                                           wParms)
+                            q_mav.put({"action": "sendpayload"})
+                        else:
+                            st["c_status"] = "fetch_empty"
+                            st["fetch_state"] = BLE_FETCH_EMPTY
+                            logger.info("BLE fetch returned no samples; upload skipped")
+                            haucs_code(11, "CAST COMPLETE but 0 samples",
+                                       wParms, sev=SEV_ALERT)   # 083026
+                    except Exception as e:
+                        st["c_status"] = "fetch_failed"
+                        st["fetch_state"] = BLE_FETCH_ERROR
+                        logger.info("fetch failed: %s: %s"
+                                    % (e.__class__.__name__, e))
+                    finally:
+                        st["fetching"] = False           # 092726
+                        # Re-arm the buffer for the next arm. auto_sensing()
+                        # on the sensor only re-fires when sample_count == 0, so this reset
+                        # is what lets the next drop trigger itself again. No sample_type
+                        # call needed -- it's never switched away from "auto".
+                        #
+                        # 092726: this was unconditional, so it also ran on a
+                        # partial or failed transfer -- erasing both the
+                        # samples that had arrived and the ones that had not,
+                        # and destroying the only thing that makes the retry
+                        # above able to recover a cut-off cast. With
+                        # BLE_KEEP_ON_PARTIAL the buffer survives for a
+                        # manual pull, at the cost of the next drop not
+                        # self-arming. Default is off: losing one cast beats
+                        # silently losing the rest of the flight.
+                        _keep = (BLE_KEEP_ON_PARTIAL and
+                                 st.get("c_status") in ("fetch_partial",
+                                                        "fetch_empty",
+                                                        "fetch_failed"))
+                        if _keep:
+                            logger.info(
+                                "092726 sensor NOT re-armed (%s): buffer kept "
+                                "for a manual fetch. The next drop will not "
+                                "self-trigger until it is reset."
+                                % st.get("c_status"))
+                            gcs_status("SENSOR BUFFER KEPT (%s), next cast "
+                                       "will NOT arm" % st.get("c_status"),
+                                       wParms, force=True, sev=SEV_ALERT)
+                        else:
                             try:
                                 ble.set_sample_reset()
                                 time.sleep(0.1)
                                 logger.info("re-armed for next sample")
                             except Exception as e:
                                 logger.info("failed to re-arm sensor for next sample: %s" % e)
-
-                    else:
-                        st["c_status"] = "fetch_skipped_disconnected"
 
                 elif action == "DISCONNECT":
                     ble_close(ble)
@@ -2002,6 +2306,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
             ina_hud_tick(m_fc, wincfg, _now)
             bme_hud_tick(m_fc, wincfg, _now)             # 092226
             servo_hud_tick(m_fc, wincfg, _now)           # 092426
+            ble_hud_tick(m_fc, wincfg, blest, _now)      # 092726
             haucs_tick(m_fc, _now)
 
             if DEBUG_TRIGGER_TIMING:
@@ -2154,6 +2459,27 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                                     "completes." % winst["RETRACTED"])
                     else:
                         fsm_st["deploy_allowed"] = False   # lock it immediately
+
+                        # 092726: a release while a sample download is still in
+                        # flight puts the sensor back under water mid-transfer
+                        # and kills the link. On 092726 a rising edge arrived
+                        # 10 s into a 282-sample download: the first corrupted
+                        # record landed 0.14 s after the servo started driving,
+                        # and the transfer timed out having delivered 187.
+                        #
+                        # Nothing here can un-command the mission, so this does
+                        # not block the release -- it records the reason the cast
+                        # is short, and ble_thread reads release_t to stop
+                        # retrying the transfer into water.
+                        blest["release_t"] = time.time()
+                        if blest.get("fetching"):
+                            logger.info(
+                                "WARNING: 092726 release commanded while a BLE "
+                                "fetch is still in progress. The sensor is about "
+                                "to go back under water and the transfer will be "
+                                "cut off.")
+                            haucs_code(17, "RELEASE DURING FETCH, cast will be "
+                                       "short", wincfg, sev=SEV_ALERT)
 
                         # Lock the sampling location in now, at the rising edge, while it is
                         # still fresh, not later once the drone may have already taken back
