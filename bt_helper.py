@@ -67,6 +67,7 @@ class BluetoothReader(QObject):
         self.ble_mutex = ble_mutex
         self.ble = BLERadio()
         self._abort = False
+        self._last_full_reconnect = 0.0      # 092726, see _full_reconnect()
 
     def connect_by_address(self, addr):
         for attempt in range(1,3):
@@ -100,6 +101,10 @@ class BluetoothReader(QObject):
                 self.sensor_name = adv.complete_name
                 self.sdata['name'] = adv.complete_name[9:]
                 self.sdata['connection'] = True
+                # 092726: a fresh link inherited the OLD timeout count, so
+                # check_connection_status() declared it dead on the very next
+                # poll and the reconnect was wasted.
+                self.transmission_timeouts = 0
                 logger.debug(f"successfully connected to {adv}")
                 connection_success = True
                 
@@ -132,15 +137,81 @@ class BluetoothReader(QObject):
         self.sdata['connection'] = connected
         return connected
 
+    # 092726: recovery from a mid-transfer receive timeout.
+    #
+    # A timeout in send_receive_command() increments transmission_timeouts and
+    # returns EARLY, before the reset at the end of that function.
+    # check_connection_status() then reports the link dead for as long as the
+    # counter is non-zero. But a receive timeout is a DATA timeout: the GATT
+    # link is still up, so reconnect() took its "already connected, do nothing"
+    # path and returned True having cleared nothing. Nothing else resets the
+    # counter, and every caller gates on sdata['connection'], so no further
+    # command was ever attempted -- and a successful command was the only thing
+    # that would have reset it.
+    #
+    # Net effect: ONE receive timeout killed BLE for the life of the process.
+    # On the 092726 flight a truncated sample transfer at 14:53:21 did exactly
+    # that. The two casts after it could not fetch at all: 165 seconds of 1 Hz
+    # polling with reconnect() returning True every pass and zero scans made.
+    #
+    # Recovery is two-stage on purpose. send_receive_command() gates only on
+    # uart_connection.connected, NOT on sdata['connection'], so a probe really
+    # does go out: if the sensor answers, the counter clears itself at the end
+    # of that call and the link is proven good in milliseconds with no rescan.
+    # Only if the probe fails is the link genuinely wedged, and then it gets a
+    # real teardown before connect().
+    PROBE_TIMEOUT_S = 1.0
+    RECONNECT_MIN_GAP_S = 5.0
+
     def reconnect(self):
         if not (self.uart_connection and self.uart_connection.connected):
             if self.sdata['connection'] != False:
                 logger.info('sdata reported connected while uart_connection.connected is false')
                 self.sdata['connection'] = False
-            return self.connect()
-        
-        logger.debug('reconnect attempted, already connected, do nothing')
-        return True
+            return self._full_reconnect()
+
+        if self.transmission_timeouts == 0:
+            logger.debug('reconnect attempted, already connected, do nothing')
+            return True
+
+        # 092726: link nominally up but a transfer timed out. Probe it.
+        logger.info('092726 link is up but %d timeout(s) recorded, probing',
+                    self.transmission_timeouts)
+        try:
+            msg = self.send_receive_command(self.commands['s_flag'],
+                                            timeout=self.PROBE_TIMEOUT_S)
+        except Exception as e:
+            logger.error('092726 probe raised %s', e)
+            msg = ""
+        if msg and self.transmission_timeouts == 0:
+            logger.info('092726 probe answered, link healthy again, no rescan needed')
+            self.sdata['connection'] = True
+            return True
+
+        logger.info('092726 probe failed, link is wedged, tearing it down')
+        try:
+            self.uart_connection.disconnect()
+        except Exception as e:
+            logger.error('092726 disconnect raised %s', e)
+        self.uart_connection = None
+        self.sdata['connection'] = False
+        return self._full_reconnect()
+
+    def _full_reconnect(self):
+        """092726: connect() with a floor between attempts.
+
+        ble_thread polls this at 1 Hz and sets its own last_poll BEFORE calling,
+        so a connect() that takes several seconds is retried immediately on
+        return -- a continuous scan loop. That is very likely what produces the
+        org.bluez.Error.NotReady / DBus.Error.NoReply bursts: a struggling
+        adapter being pushed harder rather than given room."""
+        now = time.monotonic()
+        if (now - self._last_full_reconnect) < self.RECONNECT_MIN_GAP_S:
+            logger.debug('092726 full reconnect skipped, %.1fs since the last',
+                         now - self._last_full_reconnect)
+            return False
+        self._last_full_reconnect = now
+        return self.connect()
 
     def init_sensor_status(self):
         try:
