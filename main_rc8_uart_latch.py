@@ -118,7 +118,13 @@ except ImportError:
 #                    the line never reads out. Code 18 is in the table for
 #                    parity with the direct-drive build and the GCS module,
 #                    and is never raised by this file.
-SCRIPT_VERSION = "latch-092726.2"
+#   latch-092726.3   same four fixes as direct-092726.3: battery re-read per
+#                    cast, an abandoned fetch no longer leaves the sensor unable
+#                    to arm, the depth reference logged per cast, and corrupted
+#                    BLE records dropped instead of stored as zeros (that one is
+#                    in bt_helper.py). All of ble_thread is shared byte for byte
+#                    with the direct-drive build.
+SCRIPT_VERSION = "latch-092726.3"
 
 # simulator flags
 data_sim_flag = True
@@ -348,6 +354,9 @@ ble_st = {
     "last_expect": 0,       # 092726 samples the sensor said it had
     "release_t": 0.0,       # 092726 time.time() of the last release commanded
     "fetch_state": 0,       # 092726 BLE_FETCH_* outcome of the last fetch
+    "release_active": False,  # 092726 True between release and its fetch
+    "needs_reset": False,   # 092726 a cast was abandoned, sensor still holds it
+    "recovery_tried": False,  # 092726 one recovery fetch already attempted
 }
 
 # Buffer json
@@ -1377,10 +1386,6 @@ def rail_summary():
         return "rail err %s" % e.__class__.__name__
 
 
-
-
-
-
 def send_payload_reported(link, cols, state, cfg):
     """
     081426: wrapper around send_payload that tells the operator what went out.
@@ -2045,6 +2050,35 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                         pass
                 elif not st.get("fetching"):
                     st["c_status"] = "connected"
+                    # 092726: an abandoned fetch (code 15) left the sensor's
+                    # buffer full, which blocks auto_sensing() on the next drop.
+                    # The link is back now, so deal with it: try ONCE to fetch
+                    # the cast properly -- the data is still there and that path
+                    # caches, uploads and resets on its own -- and only reset
+                    # blind if that fails too. Skipped while a cast is running,
+                    # because deploy_lat/lon would then belong to the new cast.
+                    if st.get("needs_reset") and not st.get("release_active"):
+                        if not st.get("recovery_tried"):
+                            st["recovery_tried"] = True
+                            logger.info("092726 link is back and a cast is still "
+                                        "unfetched, re-queueing one FETCH")
+                            q_ble.put({"action": "FETCH", "recovery": True})
+                        else:
+                            logger.info("092726 recovery fetch did not succeed, "
+                                        "resetting the sensor so the next cast "
+                                        "can arm (this cast is lost)")
+                            try:
+                                ble.set_sample_reset()
+                                time.sleep(0.1)
+                                st["needs_reset"] = False
+                                st["recovery_tried"] = False
+                                gcs_status("unfetched cast discarded, sensor "
+                                           "re-armed", wParms, force=True,
+                                           sev=SEV_ALERT)
+                            except Exception as e:
+                                logger.info("092726 deferred reset failed, will "
+                                            "retry: %s: %s"
+                                            % (e.__class__.__name__, e))
 
             try:
                 cmd = q_ble.get(timeout=0.25)
@@ -2090,8 +2124,20 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             continue
                         st["c_status"] = "fetch_skipped_disconnected"
                         st["fetch_state"] = BLE_FETCH_NOLINK        # 092726
+                        # 092726: the sensor still holds this cast, and its
+                        # auto_sensing() only re-fires at sample_count == 0, so
+                        # leaving the buffer full stops the NEXT cast collecting
+                        # anything -- one abandoned fetch silently killing the
+                        # rest of the sortie. It cannot be reset here either:
+                        # set_sample_reset() goes through send_receive_command,
+                        # which needs the link that just failed. So flag it and
+                        # let the poll deal with it once the link is back.
+                        st["needs_reset"] = True
+                        st["recovery_tried"] = False
                         logger.info("092726 FETCH abandoned: BLE link still down "
-                                    "after %.1f s" % _waited)
+                                    "after %.1f s. Sensor buffer left intact; "
+                                    "will retry the fetch once the link returns."
+                                    % _waited)
                         haucs_code(15, "BLE LINK DOWN %.0f s, cast NOT fetched"
                                    % _waited, wParms, sev=SEV_ALERT)
                         continue
@@ -2108,6 +2154,20 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                         sflag = ble.get_sampl_flag()
                         logger.info("stop sampling sampling flag: %s" % sflag)
                         s_size = ble.get_sample_size()
+                        # 092726: re-read the battery. get_battery() ran once in
+                        # init_sensor_status() at startup and never again, and
+                        # broadcast_value() then wrote that single number into
+                        # every sample of every cast for the whole flight -- so
+                        # batt_v was a startup constant, not a measurement, and
+                        # sag under load was invisible. On 092726 it read 3.81 V
+                        # before the first cast and the whole session carried
+                        # 3.81. One extra round trip, ~60 ms against a transfer
+                        # that takes ten seconds.
+                        try:
+                            ble.get_battery()
+                        except Exception as e:
+                            logger.info("092726 battery read failed: %s: %s"
+                                        % (e.__class__.__name__, e))
                         # 081426: the message the operator is waiting for.
                         try:
                             _n = int(s_size[1])
@@ -2183,6 +2243,34 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             press_list = best["press"]
                             logger.info("sampling finished, length:%s" % n)
                             ts_list = list(range(n))
+                            # 092726: a delivered cast clears any pending
+                            # recovery -- the finally below resets the sensor,
+                            # so the next drop can arm normally.
+                            st["needs_reset"] = False
+                            st["recovery_tried"] = False
+                            # 092726: depth derives from init_pressure, so the
+                            # gap between it and this cast's own first sample is
+                            # a fixed offset on every depth in the cast. On the
+                            # 092726 14:52 cast that gap was 15 hPa, about six
+                            # inches of water -- either the docked sensor sitting
+                            # below the surface, or `cal ps` having run at a
+                            # different elevation. Logged per cast so that it
+                            # needs no archaeology to find later.
+                            try:
+                                _ip = float(ble.sdata.get("init_pressure"))
+                                logger.info("092726 depth reference: "
+                                            "init_pressure=%.2f hPa, first "
+                                            "sample=%.2f hPa, offset=%+.2f hPa "
+                                            "(~%+.1f in of water)"
+                                            % (_ip, press_list[0],
+                                               press_list[0] - _ip,
+                                               (press_list[0] - _ip) * 0.4016))
+                            except Exception as e:
+                                logger.info("092726 depth reference unavailable: "
+                                            "%s: %s" % (e.__class__.__name__, e))
+                            logger.info("092726 battery at this cast: %s V (%s)"
+                                        % (ble.sdata.get("battv"),
+                                           ble.sdata.get("batt_status")))
 
                             # lat/lon were locked in mav_thread at the moment the winch
                             # released (deploy rising edge), not re-read here, so this is
@@ -2286,6 +2374,12 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                             try:
                                 ble.set_sample_reset()
                                 time.sleep(0.1)
+                                # 092726: this reset is exactly what a pending
+                                # needs_reset was waiting for, so clear it here
+                                # rather than letting the poll reset a second
+                                # time on the next pass.
+                                st["needs_reset"] = False
+                                st["recovery_tried"] = False
                                 logger.info("re-armed for next sample")
                             except Exception as e:
                                 logger.info("failed to re-arm sensor for next sample: %s" % e)
@@ -2640,6 +2734,11 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         # is short, and ble_thread reads release_t to stop
                         # retrying the transfer into water.
                         blest["release_t"] = time.time()
+                        # 092726: blocks the deferred recovery fetch while a cast
+                        # is running -- deploy_lat/lon are being overwritten just
+                        # below, so a recovery fetch here would stamp the OLD
+                        # cast's samples with the NEW cast's position.
+                        blest["release_active"] = True
                         if blest.get("fetching"):
                             logger.info(
                                 "WARNING: 092726 release commanded while a BLE "
@@ -2681,6 +2780,7 @@ def mav_thread(stop_evt, q_winch, q_ble, q_mav, wincfg, winst, blest):
                         haucs_code(0, None, wincfg)              # 092526
                     else:
                         logger.info("MAV to BLE: fetch data from BLE sensor")
+                        blest["release_active"] = False      # 092726
                         q_ble.put({"action": "FETCH"})
 
                 if flags["cycle_deactivated"]:

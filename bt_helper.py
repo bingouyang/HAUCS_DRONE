@@ -68,6 +68,7 @@ class BluetoothReader(QObject):
         self.ble = BLERadio()
         self._abort = False
         self._last_full_reconnect = 0.0      # 092726, see _full_reconnect()
+        self.corrupted_records = 0           # 092726, see extract_message()
 
     def connect_by_address(self, addr):
         for attempt in range(1,3):
@@ -327,6 +328,7 @@ class BluetoothReader(QObject):
                 print(f"received dstart")
 
                 self.data_counter = 0
+                self.corrupted_records = 0           # 092726, per transfer
                 self.sdata["do_vals"] = []
                 self.sdata["temp_vals"] = []
                 self.sdata["pressure_vals"] = []
@@ -337,10 +339,25 @@ class BluetoothReader(QObject):
                     temp_val = float(value[4])
                     pressure_val = float(value[6])
                 except:
-                    logger.warning(f'data corrupted in ble transfer {key, value}')
-                    do = 0
-                    temp_val = 0
-                    pressure_val = 0
+                    # 092726: was appending 0, 0, 0 here. A record split across
+                    # two BLE reads therefore became a SAMPLE reading DO 0,
+                    # temp 0 C, pressure 0 hPa, which was cached and uploaded to
+                    # the base station as real data. Absolute pressure is never
+                    # 0, so those rows are physically impossible - but nothing
+                    # downstream checks, and they drag any DO average and break
+                    # the depth derivation for those rows.
+                    #
+                    # Two such records landed in the 092726 14:52 cast.
+                    #
+                    # Skipping keeps the three lists the same length as each
+                    # other, so nothing goes ragged; it just makes the cast one
+                    # sample shorter. The dfinish handler below already compares
+                    # data_counter against the sensor's own count and warns, so
+                    # the loss is reported rather than hidden.
+                    self.corrupted_records += 1
+                    logger.warning(f'data corrupted in ble transfer, record '
+                                   f'dropped {key, value}')
+                    return
 
                 self.sdata['do_vals'].append(do)
                 self.sdata["temp_vals"].append(temp_val)
@@ -354,6 +371,11 @@ class BluetoothReader(QObject):
 
                 if self.data_counter != self.current_sample_size:
                     logger.warning(f"size mismatch between data collected on sensor and data received: {self.current_sample_size} vs. {self.data_counter}")
+                if self.corrupted_records:
+                    # 092726: these used to be substituted with zeros and passed
+                    # off as samples, so counting them here is new information.
+                    logger.warning(f"092726 {self.corrupted_records} corrupted "
+                                   f"record(s) dropped during this transfer")
         except:
             logger.warning(f'failed to parse {key} message, received: {value}')
 
