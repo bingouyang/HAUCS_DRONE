@@ -122,7 +122,24 @@ except ImportError:
 #                     Plus: BLE link state on the HUD as BLES/BLEN, and code 17
 #                     when a release is commanded while a fetch is still
 #                     running (which is what cut the 14:52:57 cast short).
-SCRIPT_VERSION = "direct-092726.1"
+#   direct-092726.2   deploy confirmation. The descent was a pure timer and
+#                     never read the Hall sensor, so a payload that never left
+#                     its holder ran the full release, bottom pause and retract
+#                     and reported codes 1-2-3-4-7 like a good cast. Two casts
+#                     on 092726 did exactly that, with algae in the holder.
+#                     Code 18 now fires when the Hall never clears RETRACT_TH.
+#                     The test is "did it get OUT OF RANGE", not "did the
+#                     reading change": on the 14:53 cast the Hall moved
+#                     2238 -> 4507, about two inches, so a change-based check
+#                     would have passed it. RETRACT_TH is the same threshold
+#                     the pre-release check already uses, so no new calibration.
+#                     Also: throttled release/retract logging carrying hall,
+#                     pwm and the rail. The INA226 figures only ever reached
+#                     WAMP/WPKA on the HUD, which Mission Planner does not
+#                     record, and that blocked two separate post-mortems on the
+#                     092726 flight - a 45 s crawl at the end of one retract,
+#                     and a release where nothing moved.
+SCRIPT_VERSION = "direct-092726.2"
 
 # simulator flags
 data_sim_flag = False
@@ -256,9 +273,39 @@ wParms = {
     # 092426: commanded servo PWM to the HUD, in microseconds. 0 = pulses
     # stopped (servo off, drawing nothing), 1500 = commanded neutral.
     "SERVO_HUD_HZ": 2.0,
-    # 092726: BLE link state (BLES) and last-fetch sample count (BLEN) to the
-    # HUD. 1 Hz is plenty -- the state changes a handful of times per cast.
+    # 092726: BLE link state (BLES) to the HUD. 1 Hz is plenty -- the state
+    # changes a handful of times per cast.
     "BLE_HUD_HZ": 1.0,
+    # 092726: 1 = also publish BLEF (last fetch outcome) and BLEN (samples
+    # received) alongside BLES. Which of them an operator actually binds to a
+    # Quick window cell is their choice in Mission Planner, not this script's --
+    # publishing all three costs 3 floats/sec and is what lets the GCS module
+    # record them in haucs.log. Set to 0 only to keep MP's field list short.
+    #
+    # BLES is the LIVE link state, so it reads disconnected for most of every
+    # cast: the sensor is under water and 2.4 GHz does not get out of water.
+    # That is normal, not a fault.
+    #
+    # BLEN alone is ambiguous -- 0 means either "never fetched" or "sensor had
+    # nothing" -- so BLEF is what distinguishes a recovered cast from a lost
+    # one. They are only useful together.
+    "BLE_HUD_EXTRA": 1,
+    # 092726: deploy confirmation. The descent is a pure timer -- it never read
+    # the Hall sensor -- so a payload that never left its holder still ran the
+    # full release, pause and retract and reported a textbook cast (codes
+    # 1-2-3-4-7). That happened twice on 092726 with algae in the holder.
+    #
+    # The test is "did the payload get out of Hall range", NOT "did the reading
+    # change": on the 14:53 cast the Hall moved 2238 -> 4507 and stopped there,
+    # which is about two inches, so a change-based check passes a stuck cast.
+    # RETRACT_TH (8000) is the same threshold the pre-release check already
+    # uses for "line is out", so this needs no new calibration.
+    #
+    # RELEASE_CONFIRM_SEC is when to warn, not when to give up: the cast still
+    # runs to completion. Warning early is the point -- the operator is over
+    # the pond and can look at the airframe.
+    "RELEASE_CONFIRM_SEC": 5.0,
+    "RELEASE_HALL_HZ": 2.0,     # how often to read Hall during the descent
     # 083026: 1 = pilot-critical text is promoted to SEV_ALERT and flashes on
     # the Mission Planner HUD. 0 = everything goes at INFO, so the Messages tab
     # is unchanged but the HUD flash stops. Set 0 once HAUCS is bound to a
@@ -665,10 +712,74 @@ def release_win(servo, adc, cfg, st, stop_evt):
     servo.value = float(svalue)
     haucs_code(2)                                            # 083026 descending
 
+    # 092726: deploy confirmation. See RELEASE_CONFIRM_SEC in wParms. The Hall
+    # was never read during the descent, so a payload stuck in its holder ran
+    # the whole cast and reported codes 1-2-3-4-7 like a good one.
+    _dep_th = float(cfg.get("RETRACT_TH", 8000))
+    _dep_deadline = t0 + float(cfg.get("RELEASE_CONFIRM_SEC", 5.0) or 5.0)
+    _dep_period = 1.0 / float(cfg.get("RELEASE_HALL_HZ", 2.0) or 2.0)
+    _dep_next = t0
+    _dep_peak = hall_start if isinstance(hall_start, (int, float)) else -1
+    _dep_last = _dep_peak
+    _dep_ok = False
+    _dep_warned = False
+    _log_next = t0
+
     while not stop_evt.is_set():
         if (time.time() - t0) > cfg["RELEASE_SEC"]:
             logger.info("Release complete: RELEASE_SEC=%ss reached" % cfg["RELEASE_SEC"])
             break
+
+        _now = time.time()
+        if _now >= _dep_next:
+            _dep_next = _now + _dep_period
+            try:
+                _dep_last = hall_raw(adc)
+                if _dep_last > _dep_peak:
+                    _dep_peak = _dep_last
+                if _dep_last > _dep_th:
+                    if _dep_warned and not _dep_ok:
+                        # It broke free after the warning went out. Say so, or
+                        # the Messages tab keeps an unresolved alert for a cast
+                        # that turned out fine.
+                        logger.info("092726 payload cleared the holder late, at "
+                                    "%.1fs (hall %s). Cast is good."
+                                    % (_now - t0, _dep_last))
+                        # Put the HUD back to "descending" rather than leaving
+                        # 18 for the caller to clear: the cast really is fine
+                        # from here, and relying on winch_thread's next
+                        # haucs_code() would leave a stale fault if that path
+                        # ever changes.
+                        haucs_code(2, "payload freed late at %.0fs, cast OK"
+                                   % (_now - t0), cfg)
+                    _dep_ok = True
+            except Exception as e:
+                # Never let a Hall read break the descent: the cast is still
+                # valid without the confirmation, it just cannot be checked.
+                logger.info("092726 release Hall read failed: %s: %s"
+                            % (e.__class__.__name__, e))
+                _dep_next = _now + 1.0
+
+        # One throttled line carrying what used to exist only on the HUD.
+        # Twice now a post-mortem has stalled because the descent and retract
+        # current went to WAMP/WPKA and nowhere else.
+        if _now >= _log_next:
+            _log_next = _now + 2.0
+            logger.info("092726 release t=%4.1fs hall=%s peak=%s pwm=%s %s"
+                        % (_now - t0, _dep_last, _dep_peak,
+                           _servo.get("usec"), rail_summary()))
+
+        if (not _dep_ok) and (not _dep_warned) and _now > _dep_deadline:
+            _dep_warned = True
+            # Warn, do not abort. The operator is over the pond and can look at
+            # the airframe; ending the cast early is a behaviour change and a
+            # late-clearing payload would be cut off for nothing.
+            logger.info("WARNING: 092726 payload has not left the holder: "
+                        "peak hall %s after %.1fs, needs > %.0f. Algae or line "
+                        "snag in the holder is the usual cause. Cast continues."
+                        % (_dep_peak, _now - t0, _dep_th))
+            haucs_code(18, "PAYLOAD STUCK? hall %s < %.0f"
+                       % (_dep_peak, _dep_th), cfg, sev=SEV_ALERT)
 
         # 082326: mid-release polarity check removed; the servo no longer
         # flips direction on its own.
@@ -686,6 +797,21 @@ def release_win(servo, adc, cfg, st, stop_evt):
 
     st["RETRACTED"] = 0  # mark as extended after descent completes
     neutral(servo, cfg)
+
+    # 092726: record the deploy verdict. peak_hall is the number to watch across
+    # a session: with algae building up in the holder it falls cast over cast
+    # before it fails outright, so it is an early warning rather than a
+    # post-mortem. On 092726 it went ~12430, ~12430, 4507, 1468.
+    st["release_peak_hall"] = _dep_peak
+    st["deployed"] = bool(_dep_ok)
+    logger.info("092726 release done: peak hall %s (needs > %.0f) -> %s"
+                % (_dep_peak, _dep_th,
+                   "payload deployed" if _dep_ok else "DID NOT DEPLOY"))
+    if not _dep_ok:
+        # Fires whether or not the mid-release warning already did: the earlier
+        # one can be missed, and this is the one that is true at the end.
+        haucs_code(18, "PAYLOAD DID NOT DEPLOY, hall peak %s" % _dep_peak,
+                   cfg, sev=SEV_ALERT)
 
 def hall_median(adc, n=3, gap=0.02):
     """
@@ -843,9 +969,15 @@ def retract_adaptive(servo, adc, cfg, st):
 
     pwr = dist / float(cfg["HALL_MAX"] - cfg["HALL_MIN"])
     pwr = pwr * cfg["RETRACT_PWR"]
-    logger.info("currnt adaptive dist: %s" % dist)
-    logger.info("currnt hall_raw val: %s" % hall_raw(adc))
-    logger.info("pwr0: %s" % pwr)
+    # 092726: was three lines per pass, and the second one called hall_raw(adc)
+    # AGAIN purely to log it -- a second I2C read (plus another ina_poll and
+    # servo_sample) on every pass of the retract loop, reporting a DIFFERENT
+    # value than the one the decision was made on. That is why the 092726 log
+    # shows "dist: 2008" next to "hall_raw val: 4503": 2008 implies hall 4508,
+    # five counts from the value printed beside it. Now one line, reporting
+    # hall_now, the value actually used, with the rail beside it.
+    logger.info("currnt adaptive dist: %s hall=%s pwr0: %.4f pwm=%s %s"
+                % (dist, hall_now, pwr, _servo.get("usec"), rail_summary()))
 
     if pwr > 0.0:
         pwr = math.pow(pwr, 1.0 / 3.0)
@@ -915,6 +1047,7 @@ HAUCS_CODES = {
     15: "BLE LINK DOWN, cast not fetched",          # 092726
     16: "PARTIAL CAST, samples lost on BLE",        # 092726
     17: "RELEASE DURING FETCH, cast corrupted",     # 092726
+    18: "PAYLOAD DID NOT DEPLOY (holder/line?)",    # 092726
 }
 
 HAUCS_FIELD = b"HAUCS"          # NAMED_VALUE_FLOAT names are capped at 10 bytes
@@ -1010,12 +1143,16 @@ def haucs_tick(m, now=None):
 
 
 def ble_hud_tick(m, cfg, blest, now=None):
-    """092726: three BLE fields on the HUD.
+    """092726: BLE state to the HUD.
 
-        BLES  live link state, BLE_STATE above. Changes constantly.
+        BLES  live link state, BLE_STATE above. Always sent.
         BLEF  outcome of the last fetch, BLE_FETCH_STATE above. Sticky.
         BLEN  samples the last fetch actually RECEIVED -- not the sensor's
               dsize. BLEN < dsize is exactly what code 16 reports.
+
+    BLEF and BLEN are only put on the link when BLE_HUD_EXTRA is set; both are
+    logged by the fetch handler regardless, so turning them off costs no
+    information, only the Mission Planner field entries.
 
     Until now st["c_status"] was written in ten places and read in none, so
     "fetch_skipped_disconnected" existed only in the source: the operator's only
@@ -1028,8 +1165,9 @@ def ble_hud_tick(m, cfg, blest, now=None):
         return
     _blehud["last"] = now
     _named_float(m, b"BLES", BLE_STATE.get(blest.get("c_status"), -1))
-    _named_float(m, b"BLEF", blest.get("fetch_state") or 0)
-    _named_float(m, b"BLEN", blest.get("last_n") or 0)
+    if cfg.get("BLE_HUD_EXTRA", 0):
+        _named_float(m, b"BLEF", blest.get("fetch_state") or 0)
+        _named_float(m, b"BLEN", blest.get("last_n") or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1233,6 +1371,26 @@ def ina_hud_tick(m, cfg, now=None):
     # Peak accumulates at the poll rate, not this one, so a spike shorter than
     # the send interval is still reported. Reset at the start of each cast.
     _named_float(m, b"WPKA", dev.peak_a)
+
+
+def rail_summary():
+    """092726: cached rail figures as one short string for the log.
+
+    Everything the INA226 measures reached the operator only as WAMP/WPKA on
+    the HUD, which Mission Planner does not record. Two separate post-mortems
+    on the 092726 flight -- a 45 s crawl at the end of one retract, and a
+    release where the payload never moved -- could not be closed because there
+    was no current anywhere in the log. Reads cached values only, no I2C."""
+    dev = _ina["dev"]
+    if dev is None or not getattr(dev, "available", False):
+        return "rail n/a"
+    try:
+        if dev.volts is None:
+            return "rail no reading"
+        return ("%.3fA peak %.3fA %.2fV"
+                % (dev.amps or 0.0, dev.peak_a or 0.0, dev.volts))
+    except Exception as e:
+        return "rail err %s" % e.__class__.__name__
 
 
 def send_payload_reported(link, cols, state, cfg):
@@ -1697,6 +1855,11 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     # and any fixed threshold breaks at a different cast depth.
                     _home = False
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
+                        # 092726: no separate log line here. retract_adaptive()
+                        # now logs hall, dist, pwm and the rail on one line every
+                        # pass, which covers this loop, the stepped ascent and
+                        # the pre-release recovery retract alike. Elapsed time
+                        # comes from the timestamps.
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
                             logger.info("Fully retractd!")
@@ -2092,6 +2255,18 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                     % (e.__class__.__name__, e))
                     finally:
                         st["fetching"] = False           # 092726
+                        # 092726: BLEF/BLEN are not put on the link unless
+                        # BLE_HUD_EXTRA is set, so record them here instead --
+                        # one greppable line per cast carrying exactly what
+                        # those HUD fields would have shown. In the finally so
+                        # it also covers the exception path, and read back off
+                        # st rather than recomputed, so it cannot disagree with
+                        # what was actually reported.
+                        _fs = st.get("fetch_state") or 0
+                        logger.info("092726 BLEF=%d (%s) BLEN=%d of %s"
+                                    % (_fs, BLE_FETCH_STATE.get(_fs, "?"),
+                                       st.get("last_n") or 0,
+                                       st.get("last_expect")))
                         # Re-arm the buffer for the next arm. auto_sensing()
                         # on the sensor only re-fires when sample_count == 0, so this reset
                         # is what lets the next drop trigger itself again. No sample_type

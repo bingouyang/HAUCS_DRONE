@@ -106,7 +106,19 @@ except ImportError:
 #                    called haucs_code(..., force=True), and haucs_code()
 #                    takes no force kwarg, so code 11 never reached the HUD -
 #                    the except clause logged "fetch failed" instead.
-SCRIPT_VERSION = "latch-092726.1"
+#   latch-092726.2   release/retract logging now carries the rail figures and
+#                    the commanded pwm, which previously reached WAMP/WPKA on
+#                    the HUD only - Mission Planner does not record those, and
+#                    it blocked two post-mortems on the 092726 flight. Plus
+#                    peak-hall bookkeeping per cast: with algae building up in
+#                    the holder it falls cast over cast before deployment
+#                    fails outright, so it is an early warning.
+#                    No deploy check was added here: this build already ends
+#                    its release on Hall confirmation and raises code 8 when
+#                    the line never reads out. Code 18 is in the table for
+#                    parity with the direct-drive build and the GCS module,
+#                    and is never raised by this file.
+SCRIPT_VERSION = "latch-092726.2"
 
 # simulator flags
 data_sim_flag = True
@@ -261,9 +273,23 @@ wParms = {
     # 092426: commanded servo PWM to the HUD, in microseconds. 0 = pulses
     # stopped (servo off, drawing nothing), 1500 = commanded neutral.
     "SERVO_HUD_HZ": 2.0,
-    # 092726: BLE link state (BLES) and last-fetch sample count (BLEN) to the
-    # HUD. 1 Hz is plenty -- the state changes a handful of times per cast.
+    # 092726: BLE link state (BLES) to the HUD. 1 Hz is plenty -- the state
+    # changes a handful of times per cast.
     "BLE_HUD_HZ": 1.0,
+    # 092726: 1 = also publish BLEF (last fetch outcome) and BLEN (samples
+    # received) alongside BLES. Which of them an operator actually binds to a
+    # Quick window cell is their choice in Mission Planner, not this script's --
+    # publishing all three costs 3 floats/sec and is what lets the GCS module
+    # record them in haucs.log. Set to 0 only to keep MP's field list short.
+    #
+    # BLES is the LIVE link state, so it reads disconnected for most of every
+    # cast: the sensor is under water and 2.4 GHz does not get out of water.
+    # That is normal, not a fault.
+    #
+    # BLEN alone is ambiguous -- 0 means either "never fetched" or "sensor had
+    # nothing" -- so BLEF is what distinguishes a recovered cast from a lost
+    # one. They are only useful together.
+    "BLE_HUD_EXTRA": 1,
     # 083026: 1 = pilot-critical text is promoted to SEV_ALERT and flashes on
     # the Mission Planner HUD. 0 = everything goes at INFO, so the Messages tab
     # is unchanged but the HUD flash stops. Set 0 once HAUCS is bound to a
@@ -685,6 +711,7 @@ def release_win(servo, adc, cfg, st, stop_evt):
     # first pass, which is what kept the drive to ~0.1-0.25 s originally.
     released = False
     n_rel = 0
+    _dep_peak = -1                               # 092726
     tries = int(cfg.get("LATCH_TRIES", 2))
 
     for attempt in range(1, tries + 1):
@@ -709,8 +736,16 @@ def release_win(servo, adc, cfg, st, stop_evt):
             # be tuned from a real trace. Every 4th pass keeps this to ~5 Hz.
             if dist is not None:
                 n_rel += 1
+                if dist > _dep_peak:              # 092726
+                    _dep_peak = dist
                 if (n_rel % 4) == 1:
-                    logger.info("release dist: %d at %.2fs" % (dist, time.time() - t0))
+                    # 092726: the rail figures go on this line too. They only
+                    # ever reached WAMP/WPKA on the HUD, which Mission Planner
+                    # does not record, and two post-mortems on the 092726
+                    # flight could not be closed without them.
+                    logger.info("release dist: %d at %.2fs pwm=%s %s"
+                                % (dist, time.time() - t0,
+                                   _servo.get("usec"), rail_summary()))
 
             if dist is not None and dist > cfg["RETRACT_TH"]:
                 released = True
@@ -745,6 +780,15 @@ def release_win(servo, adc, cfg, st, stop_evt):
     # flag set and the next retract logged a false "Retract timeout".
     st["RETRACTED"] = 0
     neutral(servo, cfg)
+    # 092726: same bookkeeping the direct-drive build keeps. peak is the number
+    # to watch across a session -- with algae building up in the holder it falls
+    # cast over cast before it fails outright, so it is an early warning rather
+    # than a post-mortem.
+    st["release_peak_hall"] = _dep_peak
+    st["deployed"] = bool(released)
+    logger.info("092726 release done: peak hall dist %s (needs > %s) -> %s"
+                % (_dep_peak, cfg["RETRACT_TH"],
+                   "payload deployed" if released else "DID NOT DEPLOY"))
     if not released:
         haucs_code(8, "latch did not open, line not out", cfg,
                    sev=SEV_ALERT)                            # 083026
@@ -905,9 +949,15 @@ def retract_adaptive(servo, adc, cfg, st):
 
     pwr = dist / float(cfg["HALL_MAX"] - cfg["HALL_MIN"])
     pwr = pwr * cfg["RETRACT_PWR"]
-    logger.info("currnt adaptive dist: %s" % dist)
-    logger.info("currnt hall_raw val: %s" % hall_raw(adc))
-    logger.info("pwr0: %s" % pwr)
+    # 092726: was three lines per pass, and the second one called hall_raw(adc)
+    # AGAIN purely to log it -- a second I2C read (plus another ina_poll and
+    # servo_sample) on every pass of the retract loop, reporting a DIFFERENT
+    # value than the one the decision was made on. That is why the 092726 log
+    # shows "dist: 2008" next to "hall_raw val: 4503": 2008 implies hall 4508,
+    # five counts from the value printed beside it. Now one line, reporting
+    # hall_now, the value actually used, with the rail beside it.
+    logger.info("currnt adaptive dist: %s hall=%s pwr0: %.4f pwm=%s %s"
+                % (dist, hall_now, pwr, _servo.get("usec"), rail_summary()))
 
     if pwr > 0.0:
         pwr = math.pow(pwr, 1.0 / 3.0)
@@ -977,6 +1027,11 @@ HAUCS_CODES = {
     15: "BLE LINK DOWN, cast not fetched",          # 092726
     16: "PARTIAL CAST, samples lost on BLE",        # 092726
     17: "RELEASE DURING FETCH, cast corrupted",     # 092726
+    18: "PAYLOAD DID NOT DEPLOY (holder/line?)",    # 092726
+        # 092726: raised by the direct-drive build only. This build already
+        # ends its release on Hall confirmation and raises code 8 when the
+        # line never reads out, which is the same condition. Listed so the
+        # table matches the other builds and the GCS module.
 }
 
 HAUCS_FIELD = b"HAUCS"          # NAMED_VALUE_FLOAT names are capped at 10 bytes
@@ -1072,12 +1127,16 @@ def haucs_tick(m, now=None):
 
 
 def ble_hud_tick(m, cfg, blest, now=None):
-    """092726: three BLE fields on the HUD.
+    """092726: BLE state to the HUD.
 
-        BLES  live link state, BLE_STATE above. Changes constantly.
+        BLES  live link state, BLE_STATE above. Always sent.
         BLEF  outcome of the last fetch, BLE_FETCH_STATE above. Sticky.
         BLEN  samples the last fetch actually RECEIVED -- not the sensor's
               dsize. BLEN < dsize is exactly what code 16 reports.
+
+    BLEF and BLEN are only put on the link when BLE_HUD_EXTRA is set; both are
+    logged by the fetch handler regardless, so turning them off costs no
+    information, only the Mission Planner field entries.
 
     Until now st["c_status"] was written in ten places and read in none, so
     "fetch_skipped_disconnected" existed only in the source: the operator's only
@@ -1090,8 +1149,9 @@ def ble_hud_tick(m, cfg, blest, now=None):
         return
     _blehud["last"] = now
     _named_float(m, b"BLES", BLE_STATE.get(blest.get("c_status"), -1))
-    _named_float(m, b"BLEF", blest.get("fetch_state") or 0)
-    _named_float(m, b"BLEN", blest.get("last_n") or 0)
+    if cfg.get("BLE_HUD_EXTRA", 0):
+        _named_float(m, b"BLEF", blest.get("fetch_state") or 0)
+        _named_float(m, b"BLEN", blest.get("last_n") or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1295,6 +1355,28 @@ def ina_hud_tick(m, cfg, now=None):
     # Peak accumulates at the poll rate, not this one, so a spike shorter than
     # the send interval is still reported. Reset at the start of each cast.
     _named_float(m, b"WPKA", dev.peak_a)
+
+
+def rail_summary():
+    """092726: cached rail figures as one short string for the log.
+
+    Everything the INA226 measures reached the operator only as WAMP/WPKA on
+    the HUD, which Mission Planner does not record. Two separate post-mortems
+    on the 092726 flight -- a 45 s crawl at the end of one retract, and a
+    release where the payload never moved -- could not be closed because there
+    was no current anywhere in the log. Reads cached values only, no I2C."""
+    dev = _ina["dev"]
+    if dev is None or not getattr(dev, "available", False):
+        return "rail n/a"
+    try:
+        if dev.volts is None:
+            return "rail no reading"
+        return ("%.3fA peak %.3fA %.2fV"
+                % (dev.amps or 0.0, dev.peak_a or 0.0, dev.volts))
+    except Exception as e:
+        return "rail err %s" % e.__class__.__name__
+
+
 
 
 
@@ -1761,6 +1843,11 @@ def winch_thread(stop_evt, q_winch, cfg, st):
                     # and any fixed threshold breaks at a different cast depth.
                     _home = False
                     while not stop_evt.is_set() and (time.time() - t0) < dur:
+                        # 092726: no separate log line here. retract_adaptive()
+                        # now logs hall, dist, pwm and the rail on one line every
+                        # pass, which covers this loop, the stepped ascent and
+                        # the pre-release recovery retract alike. Elapsed time
+                        # comes from the timestamps.
                         retract_flag = retract_adaptive(servo, adc, cfg, st)
                         if retract_flag is True:
                             logger.info("Fully retractd!")
@@ -2156,6 +2243,18 @@ def ble_thread(stop_evt, q_ble, q_mav, st):
                                     % (e.__class__.__name__, e))
                     finally:
                         st["fetching"] = False           # 092726
+                        # 092726: BLEF/BLEN are not put on the link unless
+                        # BLE_HUD_EXTRA is set, so record them here instead --
+                        # one greppable line per cast carrying exactly what
+                        # those HUD fields would have shown. In the finally so
+                        # it also covers the exception path, and read back off
+                        # st rather than recomputed, so it cannot disagree with
+                        # what was actually reported.
+                        _fs = st.get("fetch_state") or 0
+                        logger.info("092726 BLEF=%d (%s) BLEN=%d of %s"
+                                    % (_fs, BLE_FETCH_STATE.get(_fs, "?"),
+                                       st.get("last_n") or 0,
+                                       st.get("last_expect")))
                         # Re-arm the buffer for the next arm. auto_sensing()
                         # on the sensor only re-fires when sample_count == 0, so this reset
                         # is what lets the next drop trigger itself again. No sample_type
